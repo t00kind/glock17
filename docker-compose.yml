@@ -1,0 +1,22 @@
+services:
+  crosspost:
+    build: .
+    image: max-to-ok-crosspost
+    container_name: max-to-ok-crosspost
+    restart: always
+    env_file:
+      - .env
+    environment:
+      # State внутри контейнера всегда в /data (volume ниже), независимо от .env
+      STATE_DIR: /data
+    volumes:
+      - crosspost-state:/data
+    # Логи также видны через `docker logs -f max-to-ok-crosspost`
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  crosspost-state:

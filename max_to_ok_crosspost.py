@@ -23,7 +23,16 @@ from typing import Optional
 import requests
 from dotenv import load_dotenv
 
-POSTED_IDS_FILE = "posted_ids.json"
+load_dotenv()
+
+# Каталог для файлов состояния (в Docker монтируется как volume, чтобы
+# дедупликация и marker переживали рестарт контейнера).
+STATE_DIR = os.environ.get("STATE_DIR", ".")
+os.makedirs(STATE_DIR, exist_ok=True)
+
+POSTED_IDS_FILE = os.path.join(STATE_DIR, "posted_ids.json")
+MARKER_FILE = os.path.join(STATE_DIR, "marker.txt")
+LOG_FILE = os.path.join(STATE_DIR, "crosspost.log")
 
 
 def load_posted_ids() -> set:
@@ -40,14 +49,17 @@ def save_posted_ids(ids: set) -> None:
     with open(POSTED_IDS_FILE, "w", encoding="utf-8") as f:
         json.dump(list(ids), f)
 
-load_dotenv()
+
+# Уровень логирования управляется из окружения (по умолчанию INFO для прода).
+# DEBUG пишет RAW-тела сообщений и ответы OK API — включать только для отладки.
+_LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=getattr(logging, _LOG_LEVEL, logging.INFO),
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("crosspost.log", encoding="utf-8"),
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
     ],
 )
 log = logging.getLogger(__name__)
@@ -529,13 +541,13 @@ def run_crosspost():
     Основной цикл: Long Polling из МАКС → публикация в OK.
     Хранит marker последнего обработанного обновления в файле marker.txt.
     Хранит ID уже перенесённых постов в posted_ids.json.
-    При первом запуске (нет ни одного перенесённого поста) переносит последние 3 поста.
+    При первом запуске бэкфилл управляется переменными BACKFILL_ON_EMPTY/
+    BACKFILL_COUNT (по умолчанию выключен, чтобы прод-старт не залил старые посты).
     """
-    marker_file = "marker.txt"
     marker: Optional[int] = None
 
-    if os.path.exists(marker_file):
-        with open(marker_file) as f:
+    if os.path.exists(MARKER_FILE):
+        with open(MARKER_FILE) as f:
             try:
                 marker = int(f.read().strip())
             except ValueError:
@@ -545,11 +557,14 @@ def run_crosspost():
 
     log.info("Запуск кросспостинга МАКС → Одноклассники (канал %d → группа %s)", MAX_CHAT_ID, OK_GROUP_ID)
 
-    # Если ни один пост ещё не перенесён — переносим последние 3
-    if not posted_ids:
-        log.info("Нет перенесённых постов. Загружаем последние 3 поста из канала МАКС...")
+    # Бэкфилл при пустом состоянии: по умолчанию ВЫКЛЮЧЕН (на проде иначе
+    # зальёт старые посты в реальную группу). Включается BACKFILL_ON_EMPTY=1.
+    backfill_on = os.environ.get("BACKFILL_ON_EMPTY", "0").lower() in ("1", "true", "yes")
+    backfill_count = int(os.environ.get("BACKFILL_COUNT", "3"))
+    if not posted_ids and backfill_on and backfill_count > 0:
+        log.info("Нет перенесённых постов. Загружаем последние %d поста(ов) из канала МАКС...", backfill_count)
         try:
-            recent_messages = max_get_messages(limit=3)
+            recent_messages = max_get_messages(limit=backfill_count)
             for message in reversed(recent_messages):  # от старого к новому
                 result = extract_post_from_message(message)
                 if result:
@@ -558,6 +573,8 @@ def run_crosspost():
                     time.sleep(1)  # небольшая пауза между постами
         except Exception as e:
             log.error("Ошибка при загрузке начальных постов: %s", e)
+    elif not posted_ids:
+        log.info("Состояние пустое, бэкфилл выключен (BACKFILL_ON_EMPTY=0). Переносим только новые посты.")
 
     while True:
         try:
@@ -573,7 +590,7 @@ def run_crosspost():
 
             if new_marker:
                 marker = new_marker
-                with open(marker_file, "w") as f:
+                with open(MARKER_FILE, "w") as f:
                     f.write(str(marker))
 
             if not updates:
