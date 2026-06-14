@@ -1,0 +1,22 @@
+# Secrets — NEVER commit
+.env
+
+# Runtime state (per-deployment, would cause dedup issues / leaks)
+posted_ids.json
+marker.txt
+bridge_state.json
+crosspost.log
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editor / junk
+Untitled
+py
+
+# Local Claude Code settings
+.claude/settings.local.json
