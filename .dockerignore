@@ -4,7 +4,9 @@
 .env.example
 *.log
 posted_ids.json
+posted_ids_vk.json
 marker.txt
+marker_vk.txt
 bridge_state.json
 __pycache__/
 *.py[cod]
