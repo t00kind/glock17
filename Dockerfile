@@ -11,7 +11,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY max_source.py max_to_ok_crosspost.py max_to_vk_crosspost.py ./
+COPY max_source.py vk_token.py get_vk_token.py max_to_ok_crosspost.py max_to_vk_crosspost.py ./
 COPY app ./app
 
 # Каталог состояния (монтируется как volume)

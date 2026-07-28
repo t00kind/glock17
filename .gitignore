@@ -1,5 +1,6 @@
 # Secrets — NEVER commit
 .env
+vk_token.json
 
 # Runtime state (per-deployment, would cause dedup issues / leaks)
 posted_ids.json

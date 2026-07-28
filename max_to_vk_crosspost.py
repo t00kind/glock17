@@ -6,10 +6,16 @@
 Переменные окружения (файл .env):
   MAX_BOT_TOKEN     - токен бота в МАКС
   MAX_CHAT_ID       - ID канала/чата МАКС, откуда читаем посты
-  VK_ACCESS_TOKEN   - токен администратора сообщества
-                      (нужны права wall, photos, video, groups, offline)
+  VK_ACCESS_TOKEN   - пользовательский токен администратора сообщества
+                      (права wall, photos, video, groups; ключ сообщества
+                      не подходит: photos.getWallUploadServer отдаёт ошибку 27)
+  VK_REFRESH_TOKEN  - refresh-токен VK ID для автообновления протухшего токена
+  VK_APP_ID         - ID Standalone-приложения, нужен для обновления токена
+  VK_DEVICE_ID      - device_id от VK ID, нужен для обновления токена
   VK_GROUP_ID       - числовой ID сообщества ВКонтакте (без минуса)
   VK_API_VERSION    - версия API (по умолчанию 5.199)
+
+Получить всю четвёрку токенов: python get_vk_token.py
 """
 
 import logging
@@ -20,6 +26,7 @@ import requests
 from dotenv import load_dotenv
 
 import max_source
+import vk_token
 from max_source import MaxSource, State, apply_markup_to_text
 
 load_dotenv()
@@ -29,7 +36,7 @@ log = logging.getLogger(__name__)
 
 # ─── Конфиг ──────────────────────────────────────────────────────────────────
 
-VK_ACCESS_TOKEN = os.environ["VK_ACCESS_TOKEN"]
+TOKENS = vk_token.get_store(max_source.STATE_DIR)
 VK_GROUP_ID = str(os.environ["VK_GROUP_ID"]).lstrip("-")
 VK_API_VERSION = os.environ.get("VK_API_VERSION", "5.199")
 
@@ -41,15 +48,33 @@ VK_WALL_OWNER_ID = f"-{VK_GROUP_ID}"
 # ─── VK API ───────────────────────────────────────────────────────────────────
 
 
-def vk_call(method: str, params: dict) -> dict:
-    """Выполнить запрос к VK API. Бросает RuntimeError на ошибку API."""
-    payload = {**params, "access_token": VK_ACCESS_TOKEN, "v": VK_API_VERSION}
+# Ошибки авторизации VK: 5 - токен недействителен/протух, 27 - метод недоступен
+# ключу сообщества (нужен пользовательский токен), 28 - протух ключ приложения
+VK_AUTH_ERRORS = (5, 28)
+
+
+def vk_call(method: str, params: dict, _retried: bool = False) -> dict:
+    """Выполнить запрос к VK API. Бросает RuntimeError на ошибку API.
+
+    Токены VK ID живут около часа, поэтому на ошибке авторизации один раз
+    обновляем токен и повторяем запрос — иначе бот умирал бы каждый час.
+    """
+    payload = {**params, "access_token": TOKENS.access_token, "v": VK_API_VERSION}
     resp = requests.post(f"{VK_API}/{method}", data=payload, timeout=60)
     resp.raise_for_status()
     data = resp.json()
     if "error" in data:
         err = data["error"]
-        raise RuntimeError(f"VK API error {err.get('error_code')}: {err.get('error_msg')}")
+        code = err.get("error_code")
+        if code in VK_AUTH_ERRORS and not _retried and TOKENS.refresh():
+            return vk_call(method, params, _retried=True)
+        if code == 27:
+            raise RuntimeError(
+                f"VK API error 27: {err.get('error_msg')}. "
+                "Метод недоступен ключу сообщества — нужен пользовательский токен "
+                "администратора (python get_vk_token.py)"
+            )
+        raise RuntimeError(f"VK API error {code}: {err.get('error_msg')}")
     log.debug("%s → %s", method, data.get("response"))
     return data["response"]
 
