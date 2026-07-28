@@ -3,7 +3,9 @@
 
 # Runtime state (per-deployment, would cause dedup issues / leaks)
 posted_ids.json
+posted_ids_vk.json
 marker.txt
+marker_vk.txt
 bridge_state.json
 crosspost.log
 *.log

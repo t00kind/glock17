@@ -11,10 +11,12 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY max_to_ok_crosspost.py .
+COPY max_source.py max_to_ok_crosspost.py max_to_vk_crosspost.py ./
+COPY app ./app
 
 # Каталог состояния (монтируется как volume)
 RUN mkdir -p /data
 VOLUME ["/data"]
 
-CMD ["python", "max_to_ok_crosspost.py"]
+# Площадка выбирается CROSSPOST_TARGET (ok | vk)
+CMD ["python", "app/main.py"]

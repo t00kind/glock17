@@ -23,51 +23,15 @@ from typing import Optional
 import requests
 from dotenv import load_dotenv
 
+import max_source
+from max_source import MaxSource, State, apply_markup_to_text
+
 load_dotenv()
 
-# Каталог для файлов состояния (в Docker монтируется как volume, чтобы
-# дедупликация и marker переживали рестарт контейнера).
-STATE_DIR = os.environ.get("STATE_DIR", ".")
-os.makedirs(STATE_DIR, exist_ok=True)
-
-POSTED_IDS_FILE = os.path.join(STATE_DIR, "posted_ids.json")
-MARKER_FILE = os.path.join(STATE_DIR, "marker.txt")
-LOG_FILE = os.path.join(STATE_DIR, "crosspost.log")
-
-
-def load_posted_ids() -> set:
-    if os.path.exists(POSTED_IDS_FILE):
-        with open(POSTED_IDS_FILE, encoding="utf-8") as f:
-            try:
-                return set(json.load(f))
-            except (ValueError, TypeError):
-                pass
-    return set()
-
-
-def save_posted_ids(ids: set) -> None:
-    with open(POSTED_IDS_FILE, "w", encoding="utf-8") as f:
-        json.dump(list(ids), f)
-
-
-# Уровень логирования управляется из окружения (по умолчанию INFO для прода).
-# DEBUG пишет RAW-тела сообщений и ответы OK API — включать только для отладки.
-_LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
-
-logging.basicConfig(
-    level=getattr(logging, _LOG_LEVEL, logging.INFO),
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
-    ],
-)
+max_source.setup_logging("crosspost.log")
 log = logging.getLogger(__name__)
 
 # ─── Конфиг ──────────────────────────────────────────────────────────────────
-
-MAX_BOT_TOKEN = os.environ["MAX_BOT_TOKEN"]
-MAX_CHAT_ID   = int(os.environ["MAX_CHAT_ID"])
 
 OK_APP_ID      = os.environ["OK_APP_ID"]
 OK_APP_KEY     = os.environ["OK_APP_KEY"]       # публичный ключ
@@ -75,128 +39,7 @@ OK_APP_SECRET  = os.environ["OK_APP_SECRET"]    # секретный ключ
 OK_ACCESS_TOKEN = os.environ["OK_ACCESS_TOKEN"]
 OK_GROUP_ID    = os.environ["OK_GROUP_ID"]
 
-MAX_API = "https://platform-api.max.ru"
 OK_API  = "https://api.ok.ru/fb.do"
-
-# ─── MAX API ──────────────────────────────────────────────────────────────────
-
-def max_headers() -> dict:
-    return {"Authorization": MAX_BOT_TOKEN, "Content-Type": "application/json"}
-
-
-def max_get_updates(marker: Optional[int] = None, timeout: int = 20) -> dict:
-    """Long Polling: получить новые события из канала МАКС."""
-    params = {"timeout": timeout, "limit": 100}
-    if marker is not None:
-        params["marker"] = marker
-    resp = requests.get(f"{MAX_API}/updates", headers=max_headers(), params=params, timeout=timeout + 5)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def max_get_messages(limit: int = 3) -> list[dict]:
-    """Получить последние сообщения из канала МАКС (не через long polling)."""
-    params = {"chat_id": MAX_CHAT_ID, "count": limit}
-    resp = requests.get(f"{MAX_API}/messages", headers=max_headers(), params=params, timeout=15)
-    resp.raise_for_status()
-    data = resp.json()
-    # API возвращает {"messages": [...]} или просто список
-    if isinstance(data, dict):
-        return data.get("messages", [])
-    return data
-
-
-def _parse_body(body: dict) -> dict:
-    """
-    Разобрать body сообщения МАКС.
-    Возвращает dict: text, markup, photo_urls, videos.
-    Логирует полное тело на уровне DEBUG для диагностики.
-    """
-    log.debug("RAW body: %s", json.dumps(body, ensure_ascii=False))
-
-    text: str = body.get("text", "")
-    markup: list = body.get("markup", [])  # аннотации форматирования от МАКС
-
-    photo_urls: list[str] = []
-    # Список видео: каждый элемент {"payload_id": str|None, "url_id": str|None, "url": str|None}
-    # payload_id  — payload["id"] из MAX (внутренний stream ID, часто не совпадает с OK video ID)
-    # url_id      — параметр id= из URL на okcdn.ru (другой числовой ID)
-    # url         — прямая ссылка для скачивания и перезагрузки
-    videos: list[dict] = []
-
-    for attachment in body.get("attachments", []):
-        att_type = attachment.get("type")
-        payload = attachment.get("payload", {})
-        log.debug("Attachment type=%s payload=%s", att_type, json.dumps(payload, ensure_ascii=False))
-
-        if att_type == "image":
-            url = payload.get("url") or payload.get("photo_url")
-            if url:
-                photo_urls.append(url)
-        elif att_type == "video":
-            vid_url = payload.get("url") or payload.get("video_url")
-            payload_id = str(payload["id"]) if payload.get("id") else None
-
-            # Извлечь id= из URL-параметров (отличается от payload["id"])
-            url_id = None
-            if vid_url:
-                from urllib.parse import urlparse, parse_qs
-                qs = parse_qs(urlparse(vid_url).query)
-                raw = qs.get("id", [None])[0]
-                if raw and raw != payload_id:
-                    url_id = raw
-
-            log.debug("Видео payload_id=%s url_id=%s url=%s", payload_id, url_id, vid_url)
-            videos.append({"payload_id": payload_id, "url_id": url_id, "url": vid_url})
-
-    return {"text": text, "markup": markup, "photo_urls": photo_urls, "videos": videos}
-
-
-def extract_post_from_message(message: dict) -> Optional[tuple[str, dict]]:
-    """
-    Извлечь данные поста из объекта сообщения МАКС (прямой запрос /messages).
-    Возвращает (message_id, post_dict) или None.
-    """
-    # В /messages API тело сообщения может быть либо в ключе "body",
-    # либо сам message является телом (поля text/attachments на верхнем уровне).
-    body = message.get("body") or message
-    msg_id = str(
-        message.get("mid") or message.get("id") or message.get("message_id")
-        or body.get("mid") or body.get("id") or ""
-    )
-    post = _parse_body(body)
-
-    if not post["text"] and not post["photo_urls"] and not post["videos"]:
-        return None
-
-    return msg_id, post
-
-
-def extract_post_from_update(update: dict) -> Optional[tuple[str, dict]]:
-    """
-    Извлечь данные поста из события МАКС.
-    Нас интересуют события message_created в нашем канале.
-    Возвращает (message_id, post_dict) или None.
-    """
-    if update.get("update_type") != "message_created":
-        return None
-
-    message = update.get("message", {})
-    recipient = message.get("recipient", {})
-
-    # Фильтруем только сообщения из нашего канала
-    if recipient.get("chat_id") != MAX_CHAT_ID:
-        return None
-
-    body = message.get("body", {})
-    # mid хранится внутри body (не в message), берём оттуда
-    msg_id = str(message.get("id") or message.get("message_id") or body.get("mid") or "")
-    post = _parse_body(body)
-
-    if not post["text"] and not post["photo_urls"] and not post["videos"]:
-        return None
-
-    return msg_id, post
 
 
 # ─── Одноклассники API ────────────────────────────────────────────────────────
@@ -268,80 +111,6 @@ def ok_upload_photo(image_url: str) -> Optional[str]:
 
     log.warning("Не удалось получить photo token из ответа OK: %s", upload_data)
     return None
-
-
-def _char_bold(c: str) -> str:
-    """Конвертировать символ в математический жирный Unicode (блок U+1D400)."""
-    if "A" <= c <= "Z":
-        return chr(0x1D400 + ord(c) - ord("A"))
-    if "a" <= c <= "z":
-        return chr(0x1D41A + ord(c) - ord("a"))
-    if "0" <= c <= "9":
-        return chr(0x1D7CE + ord(c) - ord("0"))
-    return c
-
-
-def _char_italic(c: str) -> str:
-    """Конвертировать символ в математический курсивный Unicode (блок U+1D434)."""
-    if "A" <= c <= "Z":
-        return chr(0x1D434 + ord(c) - ord("A"))
-    if "a" <= c <= "z":
-        # 'h' занят планковской постоянной ℎ U+210E
-        return "ℎ" if c == "h" else chr(0x1D44E + ord(c) - ord("a"))
-    return c
-
-
-def apply_markup_to_text(text: str, markup: list) -> str:
-    """
-    Применить аннотации форматирования MAX к тексту через Unicode-символы.
-    OK REST API не поддерживает markup в attachment, поэтому встраиваем
-    форматирование прямо в строку.
-
-    Поддерживаемые типы:
-      bold / strong / heading → математический жирный (U+1D400)
-      italic / em             → математический курсив (U+1D434)
-      strikethrough           → комбинирующее зачёркивание (U+0336)
-      underline               → комбинирующее подчёркивание (U+0332)
-      link                    → текст без изменений (URL теряется, но текст сохраняется)
-    """
-    if not markup or not text:
-        return text
-
-    # Приоритет стилей при перекрытии (меньше — важнее)
-    _PRIORITY = {
-        "heading": 0,
-        "bold": 1, "strong": 1,
-        "italic": 2, "em": 2,
-        "strikethrough": 3,
-        "underline": 4,
-    }
-
-    # Массив стилей по символам (берём стиль с наивысшим приоритетом)
-    styles: list[str | None] = [None] * len(text)
-    for ann in sorted(markup, key=lambda a: _PRIORITY.get(a.get("type", "").lower(), 99)):
-        ann_type = ann.get("type", "").lower()
-        if ann_type not in _PRIORITY:
-            continue
-        start = ann.get("from", 0)
-        end = min(start + ann.get("length", 0), len(text))
-        for i in range(start, end):
-            if styles[i] is None:
-                styles[i] = ann_type
-
-    result = []
-    for c, style in zip(text, styles):
-        if style in ("bold", "strong", "heading"):
-            result.append(_char_bold(c))
-        elif style in ("italic", "em"):
-            result.append(_char_italic(c))
-        elif style == "strikethrough":
-            result.append(c + "̶")
-        elif style == "underline":
-            result.append(c + "̲")
-        else:
-            result.append(c)
-
-    return "".join(result)
 
 
 def ok_upload_video(video_url: str, filename: str = "video.mp4") -> Optional[str]:
@@ -504,108 +273,22 @@ def ok_post_to_group(text: str, markup: list, photo_urls: list[str], videos: lis
     return str(result)
 
 
-# ─── Основной цикл ────────────────────────────────────────────────────────────
+# ─── Точка входа ──────────────────────────────────────────────────────────────
 
-def crosspost_post(msg_id: str, post: dict, posted_ids: set) -> bool:
-    """Опубликовать пост в OK и сохранить его ID. Возвращает True при успехе."""
-    if msg_id and msg_id in posted_ids:
-        log.debug("Пост %s уже перенесён, пропускаем.", msg_id)
-        return False
-    log.info(
-        "Публикуем пост %s: текст=%r, фото=%d, видео=%d, markup=%d",
-        msg_id,
-        post["text"][:60] if post["text"] else "",
-        len(post["photo_urls"]),
-        len(post.get("videos", [])),
-        len(post.get("markup", [])),
+
+def publish(post: dict) -> str:
+    return ok_post_to_group(
+        post["text"],
+        post.get("markup", []),
+        post["photo_urls"],
+        post.get("videos", []),
     )
-    try:
-        topic_id = ok_post_to_group(
-            post["text"],
-            post.get("markup", []),
-            post["photo_urls"],
-            post.get("videos", []),
-        )
-        log.info("Пост опубликован в OK, topic_id=%s", topic_id)
-        if msg_id:
-            posted_ids.add(msg_id)
-            save_posted_ids(posted_ids)
-        return True
-    except Exception as e:
-        log.error("Ошибка публикации в OK: %s", e)
-        return False
 
 
-def run_crosspost():
-    """
-    Основной цикл: Long Polling из МАКС → публикация в OK.
-    Хранит marker последнего обработанного обновления в файле marker.txt.
-    Хранит ID уже перенесённых постов в posted_ids.json.
-    При первом запуске бэкфилл управляется переменными BACKFILL_ON_EMPTY/
-    BACKFILL_COUNT (по умолчанию выключен, чтобы прод-старт не залил старые посты).
-    """
-    marker: Optional[int] = None
-
-    if os.path.exists(MARKER_FILE):
-        with open(MARKER_FILE) as f:
-            try:
-                marker = int(f.read().strip())
-            except ValueError:
-                pass
-
-    posted_ids = load_posted_ids()
-
-    log.info("Запуск кросспостинга МАКС → Одноклассники (канал %d → группа %s)", MAX_CHAT_ID, OK_GROUP_ID)
-
-    # Бэкфилл при пустом состоянии: по умолчанию ВЫКЛЮЧЕН (на проде иначе
-    # зальёт старые посты в реальную группу). Включается BACKFILL_ON_EMPTY=1.
-    backfill_on = os.environ.get("BACKFILL_ON_EMPTY", "0").lower() in ("1", "true", "yes")
-    backfill_count = int(os.environ.get("BACKFILL_COUNT", "3"))
-    if not posted_ids and backfill_on and backfill_count > 0:
-        log.info("Нет перенесённых постов. Загружаем последние %d поста(ов) из канала МАКС...", backfill_count)
-        try:
-            recent_messages = max_get_messages(limit=backfill_count)
-            for message in reversed(recent_messages):  # от старого к новому
-                result = extract_post_from_message(message)
-                if result:
-                    msg_id, post = result
-                    crosspost_post(msg_id, post, posted_ids)
-                    time.sleep(1)  # небольшая пауза между постами
-        except Exception as e:
-            log.error("Ошибка при загрузке начальных постов: %s", e)
-    elif not posted_ids:
-        log.info("Состояние пустое, бэкфилл выключен (BACKFILL_ON_EMPTY=0). Переносим только новые посты.")
-
-    while True:
-        try:
-            data = max_get_updates(marker=marker)
-            updates = data.get("updates", [])
-            new_marker = data.get("marker")
-
-            for update in updates:
-                result = extract_post_from_update(update)
-                if result:
-                    msg_id, post = result
-                    crosspost_post(msg_id, post, posted_ids)
-
-            if new_marker:
-                marker = new_marker
-                with open(MARKER_FILE, "w") as f:
-                    f.write(str(marker))
-
-            if not updates:
-                # Long Polling вернул пустой ответ — сразу делаем следующий запрос
-                time.sleep(0.5)
-
-        except requests.exceptions.Timeout:
-            # Нормально для Long Polling
-            pass
-        except KeyboardInterrupt:
-            log.info("Остановлено вручную.")
-            break
-        except Exception as e:
-            log.error("Неожиданная ошибка: %s. Пауза 10 сек...", e)
-            time.sleep(10)
+def run_crosspost() -> None:
+    source = MaxSource()
+    state = State("posted_ids.json", "marker.txt")
+    max_source.run_loop(source, state, publish, f"OK (группа {OK_GROUP_ID})")
 
 
 if __name__ == "__main__":
