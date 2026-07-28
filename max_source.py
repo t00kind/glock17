@@ -10,7 +10,9 @@
   LOG_LEVEL           - INFO (прод) или DEBUG (пишет RAW-тела сообщений)
   STATE_DIR           - каталог для файлов состояния
   BACKFILL_ON_EMPTY   - 1 = залить старые посты при пустом состоянии
-  BACKFILL_COUNT      - сколько последних постов залить при бэкфилле
+  BACKFILL_COUNT      - сколько последних постов залить при бэкфилле (по умолчанию 3)
+  EBOI                - 1/true = принудительный бэкфилл при каждом старте,
+                        даже если состояние не пустое (ручной перенос старых постов)
 """
 
 import json
@@ -27,6 +29,12 @@ MAX_API = "https://platform-api.max.ru"
 log = logging.getLogger(__name__)
 
 STATE_DIR = os.environ.get("STATE_DIR", ".")
+
+
+def env_flag(name: str) -> bool:
+    """Булев флаг из окружения: 1/true/yes/on (имя проверяется в обоих регистрах)."""
+    value = os.environ.get(name) or os.environ.get(name.lower()) or ""
+    return value.strip().lower() in ("1", "true", "yes", "on")
 
 
 def setup_logging(log_file: str) -> None:
@@ -275,26 +283,18 @@ def run_loop(source: MaxSource, state: State, publish: Callable[[dict], str], ta
 
     marker последнего обработанного обновления и ID уже перенесённых постов
     хранятся в State, чтобы рестарт не приводил к дублям.
-    При первом запуске бэкфилл выключен (BACKFILL_ON_EMPTY=1 включает его).
+
+    Бэкфилл (перенос уже опубликованных в МАКС постов) выключен по умолчанию:
+      BACKFILL_ON_EMPTY=1 — только при первом запуске, пока состояние пустое;
+      EBOI=true           — принудительно при каждом старте, даже если состояние
+                            не пустое (ручной режим: включил, перезапустил, выключил).
+    Сколько постов забирать — BACKFILL_COUNT (по умолчанию 3).
     """
     marker = state.load_marker()
 
     log.info("Запуск кросспостинга МАКС → %s (канал %d)", target, source.chat_id)
 
-    backfill_on = os.environ.get("BACKFILL_ON_EMPTY", "0").lower() in ("1", "true", "yes")
-    backfill_count = int(os.environ.get("BACKFILL_COUNT", "3"))
-    if not state.posted_ids and backfill_on and backfill_count > 0:
-        log.info("Состояние пустое. Загружаем последние %d поста(ов) из канала МАКС...", backfill_count)
-        try:
-            for message in reversed(source.get_messages(limit=backfill_count)):  # от старого к новому
-                result = source.extract_post_from_message(message)
-                if result:
-                    _publish_one(*result, state, publish, target)
-                    time.sleep(1)
-        except Exception as e:
-            log.error("Ошибка при загрузке начальных постов: %s", e)
-    elif not state.posted_ids:
-        log.info("Состояние пустое, бэкфилл выключен (BACKFILL_ON_EMPTY=0). Переносим только новые посты.")
+    _run_backfill(source, state, publish, target)
 
     while True:
         try:
@@ -322,6 +322,49 @@ def run_loop(source: MaxSource, state: State, publish: Callable[[dict], str], ta
         except Exception as e:
             log.error("Неожиданная ошибка: %s. Пауза 10 сек...", e)
             time.sleep(10)
+
+
+def _run_backfill(
+    source: MaxSource, state: State, publish: Callable[[dict], str], target: str
+) -> None:
+    """Залить последние BACKFILL_COUNT постов канала, если бэкфилл включён.
+
+    Уже перенесённые посты отсеиваются по posted_ids, поэтому повторный запуск
+    с EBOI=true не создаёт дублей — доедет только то, чего ещё нет в соцсети.
+    """
+    forced = env_flag("EBOI")
+    count = int(os.environ.get("BACKFILL_COUNT", "3"))
+
+    if not forced and not (not state.posted_ids and env_flag("BACKFILL_ON_EMPTY")):
+        if not state.posted_ids:
+            log.info("Состояние пустое, бэкфилл выключен (EBOI/BACKFILL_ON_EMPTY). Переносим только новые посты.")
+        return
+
+    if count <= 0:
+        log.warning("Бэкфилл включён, но BACKFILL_COUNT=%d — пропускаем.", count)
+        return
+
+    log.info(
+        "Бэкфилл %s: забираем последние %d поста(ов) из канала МАКС...",
+        "принудительный (EBOI)" if forced else "при пустом состоянии",
+        count,
+    )
+    try:
+        messages = source.get_messages(limit=count)
+    except Exception as e:
+        log.error("Ошибка при загрузке постов для бэкфилла: %s", e)
+        return
+
+    log.info("Получено сообщений из МАКС: %d", len(messages))
+    published = 0
+    for message in reversed(messages):  # от старого к новому
+        result = source.extract_post_from_message(message)
+        if not result:
+            continue
+        if _publish_one(*result, state, publish, target):
+            published += 1
+            time.sleep(1)  # пауза между постами, чтобы не упереться в лимиты API
+    log.info("Бэкфилл завершён: опубликовано %d пост(ов).", published)
 
 
 def _publish_one(
