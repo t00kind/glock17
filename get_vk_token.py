@@ -8,7 +8,11 @@ code_verifier, который знает лишь наша сторона.
 
 Запуск (локально, не на сервере — нужен браузер):
 
-    VK_APP_ID=54697320 python get_vk_token.py
+    python get_vk_token.py 54697320     # ID приложения аргументом
+    python get_vk_token.py              # спросит ID при запуске
+
+ID можно задать и переменной VK_APP_ID, но в PowerShell/cmd это отдельная
+команда, поэтому аргумент проще.
 
 Скрипт напечатает ссылку, вы открываете её в браузере под аккаунтом
 администратора сообщества, разрешаете доступ, и вставляете сюда адрес
@@ -51,8 +55,11 @@ def make_pkce() -> tuple:
 
 
 def main() -> int:
-    if not APP_ID:
-        print("Не задан VK_APP_ID — это ID Standalone-приложения из dev.vk.ru", file=sys.stderr)
+    app_id = (sys.argv[1] if len(sys.argv) > 1 else APP_ID).strip()
+    if not app_id:
+        app_id = input("ID Standalone-приложения (client_id из dev.vk.ru): ").strip()
+    if not app_id.isdigit():
+        print(f"ID приложения должен быть числом, получено: {app_id!r}", file=sys.stderr)
         return 1
 
     verifier, challenge = make_pkce()
@@ -60,7 +67,7 @@ def main() -> int:
 
     url = f"{VK_ID_AUTHORIZE_URL}?" + urlencode({
         "response_type": "code",
-        "client_id": APP_ID,
+        "client_id": app_id,
         "redirect_uri": REDIRECT_URI,
         "scope": SCOPE,
         "state": state,
@@ -90,7 +97,7 @@ def main() -> int:
         "grant_type": "authorization_code",
         "code": code,
         "code_verifier": verifier,
-        "client_id": APP_ID,
+        "client_id": app_id,
         "device_id": device_id,
         "redirect_uri": REDIRECT_URI,
         "state": state,
@@ -105,7 +112,7 @@ def main() -> int:
     print(f"VK_ACCESS_TOKEN={data['access_token']}")
     print(f"VK_REFRESH_TOKEN={data.get('refresh_token', '')}")
     print(f"VK_DEVICE_ID={data.get('device_id', device_id)}")
-    print(f"VK_APP_ID={APP_ID}")
+    print(f"VK_APP_ID={app_id}")
     print(f"\nТокен действует {data.get('expires_in', '?')} сек, дальше бот обновит его сам.")
     print("Значения секретные: не публикуйте их и не коммитьте в репозиторий.")
     return 0
