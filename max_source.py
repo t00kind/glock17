@@ -37,18 +37,47 @@ def env_flag(name: str) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
-def setup_logging(log_file: str) -> None:
-    """Настроить логирование в stdout и файл внутри STATE_DIR."""
+def multi_target() -> bool:
+    """CROSSPOST_TARGET=all — обе площадки в одном процессе, каждая в своём потоке."""
+    return os.environ.get("CROSSPOST_TARGET", "").strip().lower() in ("all", "both")
+
+
+_stream_handler_added = False
+
+
+def setup_logging(log_file: str, target: str = "") -> None:
+    """Настроить логирование в stdout и в файл внутри STATE_DIR.
+
+    Вызывается каждым публикатором при импорте. В режиме CROSSPOST_TARGET=all
+    оба публикатора живут в одном процессе, поэтому:
+      - обработчик stdout добавляется только один раз (иначе строки задвоятся);
+      - в формат попадает имя потока (ok/vk), чтобы строки площадок различались;
+      - файловый обработчик пишет только строки своего потока, так что
+        crosspost.log и crosspost_vk.log остаются раздельными.
+    """
+    global _stream_handler_added
     os.makedirs(STATE_DIR, exist_ok=True)
     level = os.environ.get("LOG_LEVEL", "INFO").upper()
-    logging.basicConfig(
-        level=getattr(logging, level, logging.INFO),
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler(os.path.join(STATE_DIR, log_file), encoding="utf-8"),
-        ],
+    multi = multi_target()
+
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, level, logging.INFO))
+    formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s" if multi
+        else "%(asctime)s [%(levelname)s] %(message)s"
     )
+
+    if not _stream_handler_added:
+        stream = logging.StreamHandler()
+        stream.setFormatter(formatter)
+        root.addHandler(stream)
+        _stream_handler_added = True
+
+    file_handler = logging.FileHandler(os.path.join(STATE_DIR, log_file), encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    if multi and target:
+        file_handler.addFilter(lambda record, name=target: record.threadName == name)
+    root.addHandler(file_handler)
 
 
 # ─── Состояние ────────────────────────────────────────────────────────────────

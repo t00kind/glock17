@@ -24,7 +24,7 @@ from max_source import MaxSource, State, apply_markup_to_text
 
 load_dotenv()
 
-max_source.setup_logging("crosspost_vk.log")
+max_source.setup_logging("crosspost_vk.log", "vk")
 log = logging.getLogger(__name__)
 
 # ─── Конфиг ──────────────────────────────────────────────────────────────────

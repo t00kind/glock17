@@ -28,7 +28,7 @@ from max_source import MaxSource, State, apply_markup_to_text
 
 load_dotenv()
 
-max_source.setup_logging("crosspost.log")
+max_source.setup_logging("crosspost.log", "ok")
 log = logging.getLogger(__name__)
 
 # ─── Конфиг ──────────────────────────────────────────────────────────────────
