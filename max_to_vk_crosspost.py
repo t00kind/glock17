@@ -359,7 +359,10 @@ def vk_post_to_group(post: dict) -> str:
 # ─── Точка входа ──────────────────────────────────────────────────────────────
 
 
-def check_token() -> None:
+TOKEN_RECHECK_INTERVAL = int(os.environ.get("VK_TOKEN_RECHECK_SECONDS", "300"))
+
+
+def check_token() -> bool:
     """Проверить токен одним запросом до начала работы.
 
     Иначе неверный токен виден только как череда ошибок на каждой фотографии,
@@ -370,18 +373,31 @@ def check_token() -> None:
     except Exception as e:
         log.error(
             "Токен ВК не работает: %s. Если это токен из мини-приложения — он живёт "
-            "около суток, откройте страницу выдачи токена заново. Если ключ сообщества — "
-            "проверьте значение целиком, без кавычек и пробелов.", e
+            "около суток и привязан к IP браузера, где его выдавали. Если ключ "
+            "сообщества — проверьте значение целиком, без кавычек и пробелов.", e
         )
-        return
+        return False
     # Ответ бывает списком (старые версии API) и объектом с groups
     items = groups.get("groups", groups) if isinstance(groups, dict) else groups
     name = items[0].get("name", "?") if items else "?"
     log.info("Токен ВК проверен: доступ к сообществу «%s» есть.", name)
+    return True
+
+
+def wait_for_valid_token() -> None:
+    """Не начинать работу, пока токен не заработает.
+
+    С нерабочим токеном каждый пост давал два десятка одинаковых ошибок, а посты
+    всё равно терялись. Лучше подождать: как только токен обновят в переменных
+    окружения и сервис перезапустится, всё поедет само.
+    """
+    while not check_token():
+        log.warning("Повторная проверка токена через %d мин.", TOKEN_RECHECK_INTERVAL // 60)
+        time.sleep(TOKEN_RECHECK_INTERVAL)
 
 
 def run_crosspost() -> None:
-    check_token()
+    wait_for_valid_token()
     source = MaxSource()
     state = State("posted_ids_vk.json", "marker_vk.txt")
     max_source.run_loop(source, state, vk_post_to_group, f"VK (сообщество {VK_GROUP_ID})")
