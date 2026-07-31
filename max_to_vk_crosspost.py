@@ -6,18 +6,22 @@
 Переменные окружения (файл .env):
   MAX_BOT_TOKEN     - токен бота в МАКС
   MAX_CHAT_ID       - ID канала/чата МАКС, откуда читаем посты
-  VK_ACCESS_TOKEN   - пользовательский токен администратора сообщества
-                      (права wall, photos, video, groups; ключ сообщества
-                      не подходит: photos.getWallUploadServer отдаёт ошибку 27)
-  VK_REFRESH_TOKEN  - refresh-токен VK ID для автообновления протухшего токена
-  VK_APP_ID         - ID Standalone-приложения, нужен для обновления токена
+  VK_ACCESS_TOKEN   - ключ доступа сообщества (настройки группы → Работа с API).
+                      Права: управление сообществом, фотографии, видео, стена.
+                      Токены VK ID (vk2.a.*) не подходят: они выдаются только
+                      для авторизации на сайтах, а методы API отвечают на них
+                      ошибками 1051 и 15
+  VK_REFRESH_TOKEN  - refresh-токен VK ID, если всё же используется он
+  VK_APP_ID         - ID приложения VK ID, нужен для обновления токена
   VK_DEVICE_ID      - device_id от VK ID, нужен для обновления токена
   VK_GROUP_ID       - числовой ID сообщества ВКонтакте (без минуса)
   VK_API_VERSION    - версия API (по умолчанию 5.199)
   VK_RATE_LIMIT     - запросов в секунду к VK API (по умолчанию 3 — лимит ВК
                       для пользовательского токена)
 
-Получить всю четвёрку токенов: python get_vk_token.py
+Фотографии ключу сообщества заливаются через сервер загрузки сообщений:
+штатный photos.getWallUploadServer таким ключом вызвать нельзя (ошибка 27).
+Проверить доступные способы: python vk_probe.py
 """
 
 import logging
@@ -56,6 +60,16 @@ VK_WALL_OWNER_ID = f"-{VK_GROUP_ID}"
 # ключу сообщества (нужен пользовательский токен), 28 - протух ключ приложения
 VK_AUTH_ERRORS = (5, 28)
 VK_TOO_MANY_REQUESTS = 6
+VK_GROUP_AUTH_DENIED = 27
+
+
+class VkApiError(RuntimeError):
+    """Ошибка VK API с кодом — по нему выбирается запасной способ загрузки."""
+
+    def __init__(self, code: Optional[int], msg: str, hint: str = ""):
+        self.code = code
+        self.msg = msg
+        super().__init__(f"VK API error {code}: {msg}{hint}")
 
 # ВК разрешает пользовательскому токену 3 запроса в секунду. Пост с десятью
 # фотографиями — это десяток загрузок подряд, и без паузы ВК отвечает ошибкой 6.
@@ -114,28 +128,60 @@ def vk_call(method: str, params: dict) -> dict:
         if code in VK_AUTH_ERRORS and not refreshed and TOKENS.refresh():
             refreshed = True
             continue
-        if code == 27:
-            raise RuntimeError(
-                f"VK API error 27: {err.get('error_msg')}. "
-                "Метод недоступен ключу сообщества — нужен пользовательский токен "
-                "администратора (python get_vk_token.py)"
-            )
+        hint = ""
         if code in VK_AUTH_ERRORS and "another ip" in (err.get("error_msg") or ""):
-            raise RuntimeError(
-                f"VK API error {code}: {err.get('error_msg')}. "
-                "Токен привязан к IP машины, где его получали — получите его "
-                "на сервере: python get_vk_token.py <APP_ID> --manual"
-            )
-        raise RuntimeError(f"VK API error {code}: {err.get('error_msg')}")
-    raise RuntimeError(f"VK API {method}: исчерпаны попытки из-за лимита запросов")
+            hint = (". Токен привязан к IP машины, где его получали — "
+                    "используйте ключ сообщества, он к IP не привязан")
+        raise VkApiError(code, err.get("error_msg"), hint)
+    raise VkApiError(None, f"{method}: исчерпаны попытки из-за лимита запросов")
+
+
+def _upload_to_server(upload_url: str, img_data: bytes) -> dict:
+    resp = requests.post(
+        upload_url, files={"photo": ("photo.jpg", img_data, "image/jpeg")}, timeout=60
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _upload_photo_wall(img_data: bytes) -> list:
+    """Штатный путь. Пользовательскому токену доступен, ключу сообщества — нет."""
+    upload_url = vk_call("photos.getWallUploadServer", {"group_id": VK_GROUP_ID})["upload_url"]
+    uploaded = _upload_to_server(upload_url, img_data)
+    return vk_call("photos.saveWallPhoto", {
+        "group_id": VK_GROUP_ID,
+        "server": uploaded["server"],
+        "photo": uploaded["photo"],
+        "hash": uploaded["hash"],
+    })
+
+
+def _upload_photo_messages(img_data: bytes) -> list:
+    """Обходной путь для ключа сообщества: сервер загрузки сообщений.
+
+    photos.getWallUploadServer ключу сообщества запрещён (ошибка 27), а этот
+    сервер доступен, и wall.post полученное вложение принимает.
+    """
+    upload_url = vk_call("photos.getMessagesUploadServer", {"peer_id": 0})["upload_url"]
+    uploaded = _upload_to_server(upload_url, img_data)
+    return vk_call("photos.saveMessagesPhoto", {
+        "server": uploaded["server"],
+        "photo": uploaded["photo"],
+        "hash": uploaded["hash"],
+    })
+
+
+PHOTO_UPLOADERS = {"стену": _upload_photo_wall, "сообщения": _upload_photo_messages}
+
+# Какой способ подошёл этому токену: определяется на первой фотографии,
+# чтобы дальше не тратить лишний запрос на заведомо запрещённый метод
+_photo_strategy: Optional[str] = None
 
 
 def vk_upload_photo(image_url: str) -> Optional[str]:
     """
-    Загрузить фото по URL на стену сообщества.
-    Шаги: 1) скачать, 2) photos.getWallUploadServer, 3) загрузить,
-          4) photos.saveWallPhoto.
-    Возвращает attachment вида photo<owner_id>_<id> или None при ошибке.
+    Загрузить фото по URL и вернуть attachment вида photo<owner_id>_<id>.
+    None — если скачать или залить не вышло.
     """
     try:
         img_data = requests.get(image_url, timeout=30).content
@@ -143,32 +189,30 @@ def vk_upload_photo(image_url: str) -> Optional[str]:
         log.warning("Не удалось скачать фото %s: %s", image_url, e)
         return None
 
-    try:
-        upload_url = vk_call("photos.getWallUploadServer", {"group_id": VK_GROUP_ID})["upload_url"]
-        upload_resp = requests.post(
-            upload_url,
-            files={"photo": ("photo.jpg", img_data, "image/jpeg")},
-            timeout=60,
-        )
-        upload_resp.raise_for_status()
-        uploaded = upload_resp.json()
+    global _photo_strategy
+    names = [_photo_strategy] if _photo_strategy else list(PHOTO_UPLOADERS)
+    for name in names:
+        try:
+            saved = PHOTO_UPLOADERS[name](img_data)
+        except VkApiError as e:
+            if e.code == 27 and name != names[-1]:
+                log.info("Загрузка через %s ключу сообщества запрещена, пробуем другой способ", name)
+                continue
+            log.warning("Ошибка загрузки фото в VK: %s", e)
+            return None
+        except Exception as e:
+            log.warning("Ошибка загрузки фото в VK: %s", e)
+            return None
 
-        saved = vk_call("photos.saveWallPhoto", {
-            "group_id": VK_GROUP_ID,
-            "server": uploaded["server"],
-            "photo": uploaded["photo"],
-            "hash": uploaded["hash"],
-        })
-    except Exception as e:
-        log.warning("Ошибка загрузки фото в VK: %s", e)
-        return None
-
-    if not saved:
-        log.warning("VK не вернул сохранённое фото для %s", image_url)
-        return None
-
-    photo = saved[0]
-    return f"photo{photo['owner_id']}_{photo['id']}"
+        if not saved:
+            log.warning("VK не вернул сохранённое фото для %s", image_url)
+            return None
+        if _photo_strategy != name:
+            log.info("Фотографии заливаем через %s", name)
+            _photo_strategy = name
+        photo = saved[0]
+        return f"photo{photo['owner_id']}_{photo['id']}"
+    return None
 
 
 def vk_upload_video(video_url: str, name: str = "Видео") -> Optional[str]:

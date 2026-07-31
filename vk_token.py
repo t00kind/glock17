@@ -46,7 +46,13 @@ class VkTokenStore:
         self.path = os.path.join(state_dir, os.environ.get("VK_TOKEN_FILE", "vk_token.json"))
         self.app_id = os.environ.get("VK_APP_ID", "").strip()
         data = self._load()
-        self.access_token: str = data.get("access_token") or os.environ.get("VK_ACCESS_TOKEN", "").strip()
+        # Переменная окружения главнее файла: иначе на хостинге без консоли
+        # нельзя было бы сменить токен, пока в STATE_DIR лежит старый vk_token.json
+        env_token = os.environ.get("VK_ACCESS_TOKEN", "").strip()
+        if env_token and data.get("access_token") and env_token != data["access_token"]:
+            log.info("Берём токен из VK_ACCESS_TOKEN, сохранённый в %s игнорируем.", self.path)
+            data = {}
+        self.access_token: str = data.get("access_token") or env_token
         self.refresh_token: str = data.get("refresh_token") or os.environ.get("VK_REFRESH_TOKEN", "").strip()
         self.device_id: str = data.get("device_id") or os.environ.get("VK_DEVICE_ID", "").strip()
         if not data and os.environ.get("VK_AUTH_CODE", "").strip():
@@ -58,11 +64,14 @@ class VkTokenStore:
             )
         if self.can_refresh():
             log.info("Токен ВК: автообновление включено (VK ID).")
-        else:
+        elif self.refresh_token or os.environ.get("VK_AUTH_CODE", "").strip():
+            # Часть набора задана — значит целились в VK ID и что-то забыли
             log.warning(
-                "Токен ВК: автообновление выключено (нет VK_REFRESH_TOKEN/VK_APP_ID/VK_DEVICE_ID). "
-                "Токен VK ID живёт около часа — после протухания бот остановится на ошибке авторизации."
+                "Токен ВК: автообновление выключено (нужны VK_REFRESH_TOKEN, VK_APP_ID и "
+                "VK_DEVICE_ID вместе). Токен VK ID живёт около часа."
             )
+        else:
+            log.info("Токен ВК: постоянный (ключ сообщества), автообновление не требуется.")
 
     def _bootstrap_from_code(self) -> None:
         """Обменять код авторизации на токены при первом старте.
