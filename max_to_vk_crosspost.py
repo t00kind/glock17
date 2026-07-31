@@ -136,12 +136,37 @@ def vk_call(method: str, params: dict) -> dict:
     raise VkApiError(None, f"{method}: исчерпаны попытки из-за лимита запросов")
 
 
+def _image_kind(img_data: bytes) -> tuple:
+    """Имя файла и content-type по сигнатуре байтов.
+
+    Расширение должно совпадать с содержимым: на .jpg с картинкой PNG внутри
+    сервер загрузки отвечает пустым photo, и сохранение падает с ошибкой 100.
+    """
+    if img_data.startswith(b"\x89PNG"):
+        return "photo.png", "image/png"
+    if img_data.startswith(b"GIF8"):
+        return "photo.gif", "image/gif"
+    if img_data[8:12] == b"WEBP":
+        return "photo.webp", "image/webp"
+    return "photo.jpg", "image/jpeg"
+
+
 def _upload_to_server(upload_url: str, img_data: bytes) -> dict:
+    """Залить картинку на сервер загрузки и убедиться, что он принял её.
+
+    Сервер отвечает 200 даже когда файл не принят — тогда в photo приходит
+    пустая строка или "[]", и следом ВК отвечает "photo is undefined".
+    """
+    filename, content_type = _image_kind(img_data)
     resp = requests.post(
-        upload_url, files={"photo": ("photo.jpg", img_data, "image/jpeg")}, timeout=60
+        upload_url, files={"photo": (filename, img_data, content_type)}, timeout=120
     )
     resp.raise_for_status()
-    return resp.json()
+    uploaded = resp.json()
+    photo = uploaded.get("photo")
+    if not photo or photo in ("[]", '""'):
+        raise RuntimeError(f"сервер загрузки не принял файл ({len(img_data)} байт): {uploaded}")
+    return uploaded
 
 
 def _upload_photo_wall(img_data: bytes) -> list:
@@ -173,6 +198,29 @@ def _upload_photo_messages(img_data: bytes) -> list:
 
 PHOTO_UPLOADERS = {"стену": _upload_photo_wall, "сообщения": _upload_photo_messages}
 
+PHOTO_UPLOAD_ATTEMPTS = 3
+
+
+def _upload_with_retries(uploader, img_data: bytes) -> list:
+    """Повторить загрузку, если сервер не принял файл.
+
+    Сервер загрузки периодически отвечает пустым photo — на посте из десяти
+    фотографий так терялись три штуки. Каждая попытка берёт свежий upload_url:
+    прежний к этому моменту мог уже протухнуть.
+    """
+    for attempt in range(1, PHOTO_UPLOAD_ATTEMPTS + 1):
+        try:
+            return uploader(img_data)
+        except VkApiError:
+            raise  # ошибки API разбирает вызывающий: там выбор способа загрузки
+        except Exception as e:
+            if attempt == PHOTO_UPLOAD_ATTEMPTS:
+                raise
+            log.warning("Попытка %d/%d не удалась (%s), повторяем",
+                        attempt, PHOTO_UPLOAD_ATTEMPTS, e)
+            time.sleep(attempt)
+    return []
+
 # Какой способ подошёл этому токену: определяется на первой фотографии,
 # чтобы дальше не тратить лишний запрос на заведомо запрещённый метод
 _photo_strategy: Optional[str] = None
@@ -193,7 +241,7 @@ def vk_upload_photo(image_url: str) -> Optional[str]:
     names = [_photo_strategy] if _photo_strategy else list(PHOTO_UPLOADERS)
     for name in names:
         try:
-            saved = PHOTO_UPLOADERS[name](img_data)
+            saved = _upload_with_retries(PHOTO_UPLOADERS[name], img_data)
         except VkApiError as e:
             if e.code == 27 and name != names[-1]:
                 log.info("Загрузка через %s ключу сообщества запрещена, пробуем другой способ", name)
@@ -247,6 +295,14 @@ def vk_upload_video(video_url: str, name: str = "Видео") -> Optional[str]:
         )
         upload_resp.raise_for_status()
         log.debug("Ответ загрузки видео: %s", upload_resp.text)
+    except VkApiError as e:
+        if e.code in VK_AUTH_ERRORS or e.code == VK_GROUP_AUTH_DENIED:
+            # Обхода, как для фотографий, у видео нет: video.save ключу
+            # сообщества недоступен, а пользовательские токены ВК больше не выдаёт
+            log.warning("Видео ключом сообщества загрузить нельзя (%s) — пост уйдёт без него", e)
+        else:
+            log.warning("Ошибка загрузки видео в VK: %s", e)
+        return None
     except Exception as e:
         log.warning("Ошибка загрузки видео в VK: %s", e)
         return None

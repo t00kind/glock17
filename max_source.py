@@ -13,6 +13,8 @@
   BACKFILL_COUNT      - сколько последних постов залить при бэкфилле (по умолчанию 3)
   EBOI                - 1/true = принудительный бэкфилл при каждом старте,
                         даже если состояние не пустое (ручной перенос старых постов)
+  BACKFILL_IGNORE_POSTED - vk | ok | all: перезалить посты, даже если они уже
+                        переносились (для повторной публикации битых постов)
 """
 
 import json
@@ -353,6 +355,24 @@ def run_loop(source: MaxSource, state: State, publish: Callable[[dict], str], ta
             time.sleep(10)
 
 
+def backfill_ignores_posted(target: str) -> bool:
+    """Нужно ли при бэкфилле игнорировать список уже перенесённых постов.
+
+    BACKFILL_IGNORE_POSTED=vk перезальёт посты только во ВКонтакте, ok — только
+    в Одноклассники, all/1/true — в обе. Нужно, когда пост уехал битым (скажем,
+    без части фотографий) и его надо переопубликовать, а доступа к файлам
+    состояния на хостинге нет.
+    """
+    value = (os.environ.get("BACKFILL_IGNORE_POSTED")
+             or os.environ.get("backfill_ignore_posted") or "").strip().lower()
+    if not value:
+        return False
+    if value in ("1", "true", "yes", "on", "all"):
+        return True
+    platform = target.split()[0].lower()  # "VK (сообщество 123)" → "vk"
+    return platform in [item.strip() for item in value.split(",")]
+
+
 def _run_backfill(
     source: MaxSource, state: State, publish: Callable[[dict], str], target: str
 ) -> None:
@@ -385,22 +405,26 @@ def _run_backfill(
         return
 
     log.info("Получено сообщений из МАКС: %d", len(messages))
+    republish = backfill_ignores_posted(target)
+    if republish:
+        log.warning("BACKFILL_IGNORE_POSTED: публикуем посты заново, даже если они уже переносились.")
     published = 0
     for message in reversed(messages):  # от старого к новому
         result = source.extract_post_from_message(message)
         if not result:
             continue
-        if _publish_one(*result, state, publish, target):
+        if _publish_one(*result, state, publish, target, republish):
             published += 1
             time.sleep(1)  # пауза между постами, чтобы не упереться в лимиты API
     log.info("Бэкфилл завершён: опубликовано %d пост(ов).", published)
 
 
 def _publish_one(
-    msg_id: str, post: dict, state: State, publish: Callable[[dict], str], target: str
+    msg_id: str, post: dict, state: State, publish: Callable[[dict], str], target: str,
+    republish: bool = False,
 ) -> bool:
     """Опубликовать один пост и запомнить его ID. Возвращает True при успехе."""
-    if msg_id and msg_id in state.posted_ids:
+    if msg_id and msg_id in state.posted_ids and not republish:
         log.debug("Пост %s уже перенесён, пропускаем.", msg_id)
         return False
 
