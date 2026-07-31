@@ -39,6 +39,23 @@ log = logging.getLogger(__name__)
 _lock = threading.Lock()
 
 
+def _clean(value: str) -> str:
+    """Убрать кавычки и пробелы вокруг значения.
+
+    Панели хостингов часто сохраняют переменную вместе с кавычками, а копипаст
+    приносит перевод строки — для ВК это уже другой токен, и он отвечает
+    "invalid access_token".
+    """
+    return value.strip().strip('"').strip("'").strip()
+
+
+def fingerprint(token: str) -> str:
+    """Приметы токена для логов: сравнить с оригиналом можно, повторить — нет."""
+    if not token:
+        return "(пусто)"
+    return f"{token[:8]}...{token[-4:]} (длина {len(token)})"
+
+
 class VkTokenStore:
     """Пара access/refresh токенов VK ID с обновлением по требованию."""
 
@@ -48,13 +65,13 @@ class VkTokenStore:
         data = self._load()
         # Переменная окружения главнее файла: иначе на хостинге без консоли
         # нельзя было бы сменить токен, пока в STATE_DIR лежит старый vk_token.json
-        env_token = os.environ.get("VK_ACCESS_TOKEN", "").strip()
+        env_token = _clean(os.environ.get("VK_ACCESS_TOKEN", ""))
         if env_token and data.get("access_token") and env_token != data["access_token"]:
             log.info("Берём токен из VK_ACCESS_TOKEN, сохранённый в %s игнорируем.", self.path)
             data = {}
         self.access_token: str = data.get("access_token") or env_token
-        self.refresh_token: str = data.get("refresh_token") or os.environ.get("VK_REFRESH_TOKEN", "").strip()
-        self.device_id: str = data.get("device_id") or os.environ.get("VK_DEVICE_ID", "").strip()
+        self.refresh_token: str = data.get("refresh_token") or _clean(os.environ.get("VK_REFRESH_TOKEN", ""))
+        self.device_id: str = data.get("device_id") or _clean(os.environ.get("VK_DEVICE_ID", ""))
         if not data and os.environ.get("VK_AUTH_CODE", "").strip():
             self._bootstrap_from_code()
         if not self.access_token:
@@ -72,6 +89,7 @@ class VkTokenStore:
             )
         else:
             log.info("Токен ВК: постоянный (ключ сообщества), автообновление не требуется.")
+        log.info("Токен ВК: %s", fingerprint(self.access_token))
 
     def _bootstrap_from_code(self) -> None:
         """Обменять код авторизации на токены при первом старте.

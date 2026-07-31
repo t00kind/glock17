@@ -303,7 +303,29 @@ def vk_post_to_group(post: dict) -> str:
 # ─── Точка входа ──────────────────────────────────────────────────────────────
 
 
+def check_token() -> None:
+    """Проверить токен одним запросом до начала работы.
+
+    Иначе неверный токен виден только как череда ошибок на каждой фотографии,
+    и непонятно, дело в токене или в конкретном методе.
+    """
+    try:
+        groups = vk_call("groups.getById", {"group_id": VK_GROUP_ID})
+    except Exception as e:
+        log.error(
+            "Токен ВК не работает: %s. Проверьте VK_ACCESS_TOKEN в переменных "
+            "окружения: значение целиком, без кавычек и пробелов, ключ сообщества "
+            "из настроек группы → Работа с API → Ключи доступа.", e
+        )
+        return
+    # Ответ бывает списком (старые версии API) и объектом с groups
+    items = groups.get("groups", groups) if isinstance(groups, dict) else groups
+    name = items[0].get("name", "?") if items else "?"
+    log.info("Токен ВК проверен: доступ к сообществу «%s» есть.", name)
+
+
 def run_crosspost() -> None:
+    check_token()
     source = MaxSource()
     state = State("posted_ids_vk.json", "marker_vk.txt")
     max_source.run_loop(source, state, vk_post_to_group, f"VK (сообщество {VK_GROUP_ID})")
