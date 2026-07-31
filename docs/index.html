@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Токен для кросспостинга</title>
+<script src="https://unpkg.com/@vkontakte/vk-bridge/dist/browser.min.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0; padding: 24px 16px;
+    font: 16px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif;
+    max-width: 640px; margin-inline: auto;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  p.lead { margin: 0 0 20px; opacity: .7; font-size: 14px; }
+  button {
+    font: inherit; font-weight: 600; width: 100%;
+    padding: 14px 20px; border: 0; border-radius: 10px;
+    background: #07f; color: #fff; cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: default; }
+  button.secondary { background: #8a96a3; margin-top: 8px; }
+  textarea {
+    width: 100%; box-sizing: border-box; margin-top: 16px; padding: 12px;
+    font: 13px/1.4 ui-monospace, Menlo, Consolas, monospace;
+    border: 1px solid #8a96a355; border-radius: 10px;
+    background: transparent; color: inherit; resize: vertical;
+  }
+  .note {
+    margin-top: 16px; padding: 12px 14px; border-radius: 10px;
+    background: #8a96a31f; font-size: 14px;
+  }
+  .error { background: #ff3b301f; }
+  .ok { background: #34c7591f; }
+  ol { padding-left: 20px; }
+  li { margin-bottom: 6px; }
+  code { background: #8a96a32e; padding: 1px 5px; border-radius: 4px; font-size: 13px; }
+</style>
+</head>
+<body>
+
+<h1>Токен для кросспостинга</h1>
+<p class="lead">Страница выдаёт пользовательский токен с правами на стену и фотографии.
+Ключом сообщества фотографии на стену не публикуются — ВК отвечает ошибкой 27.</p>
+
+<button id="get">Выдать токен</button>
+<div id="out"></div>
+
+<script>
+  // ID приложения можно передать в адресе: ?app_id=12345678
+  var APP_ID = Number(new URLSearchParams(location.search).get('app_id')) || 54697320;
+  // groups нужен для работы с сообществом, video — для загрузки видеозаписей
+  var SCOPE = 'photos,wall,groups,video';
+
+  var out = document.getElementById('out');
+  var button = document.getElementById('get');
+
+  function show(html, kind) {
+    out.innerHTML = '<div class="note ' + (kind || '') + '">' + html + '</div>';
+  }
+
+  function showToken(token, scope) {
+    out.innerHTML =
+      '<textarea id="token" rows="4" readonly></textarea>' +
+      '<button class="secondary" id="copy">Скопировать</button>' +
+      '<div class="note ok"><b>Выданные права:</b> ' + (scope || '—') + '</div>' +
+      '<div class="note"><b>Что дальше</b><ol>' +
+      '<li>Скопируйте токен и вставьте в переменную <code>VK_ACCESS_TOKEN</code> на сервере.</li>' +
+      '<li>Перезапустите сервис.</li>' +
+      '<li>В логах должно появиться <code>Токен ВК проверен</code>, ' +
+      'а фотографии поедут через штатную загрузку на стену.</li>' +
+      '</ol>Токен живёт около суток — когда в логах появится ошибка 5, ' +
+      'откройте эту страницу снова и повторите.</div>';
+    document.getElementById('token').value = token;
+    document.getElementById('copy').onclick = function () {
+      var field = document.getElementById('token');
+      field.select();
+      // clipboard API внутри VK-iframe часто недоступен, execCommand надёжнее
+      try { document.execCommand('copy'); } catch (e) {}
+      this.textContent = 'Скопировано';
+    };
+  }
+
+  button.onclick = function () {
+    button.disabled = true;
+    show('Запрашиваем доступ…');
+    vkBridge.send('VKWebAppGetAuthToken', { app_id: APP_ID, scope: SCOPE })
+      .then(function (data) {
+        button.disabled = false;
+        button.textContent = 'Выдать токен заново';
+        if (!data.access_token) {
+          show('ВК не вернул токен. Попробуйте ещё раз.', 'error');
+          return;
+        }
+        showToken(data.access_token, data.scope);
+      })
+      .catch(function (error) {
+        button.disabled = false;
+        var reason = (error && error.error_data &&
+          (error.error_data.error_reason || error.error_data.error_msg)) || 'неизвестная причина';
+        show('<b>Не удалось получить токен:</b> ' + reason +
+             '<br><br>Если страница открыта не внутри ВКонтакте, откройте её как ' +
+             'мини-приложение: <code>vk.com/app' + APP_ID + '</code>', 'error');
+      });
+  };
+
+  vkBridge.send('VKWebAppInit').catch(function () {
+    show('Страница открыта вне ВКонтакте — VK Bridge недоступен. ' +
+         'Откройте <code>vk.com/app' + APP_ID + '</code> под аккаунтом администратора сообщества.',
+         'error');
+  });
+</script>
+
+</body>
+</html>
