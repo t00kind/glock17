@@ -16,6 +16,10 @@
   VK_APP_ID         - ID Standalone-приложения (client_id)
   VK_DEVICE_ID      - device_id, выданный VK ID вместе с токеном
   VK_TOKEN_FILE     - имя файла с токенами внутри STATE_DIR (vk_token.json)
+  VK_AUTH_CODE      - одноразовый код авторизации: бот сам обменяет его на
+                      токены при первом старте (для хостинга без консоли)
+  VK_CODE_VERIFIER  - PKCE-verifier к этому коду
+  VK_REDIRECT_URI   - redirect_uri, с которым получали код
 """
 
 import json
@@ -28,6 +32,7 @@ from typing import Optional
 import requests
 
 VK_ID_AUTH_URL = "https://id.vk.com/oauth2/auth"
+DEFAULT_REDIRECT_URI = "https://oauth.vk.com/blank.html"
 
 log = logging.getLogger(__name__)
 
@@ -44,10 +49,12 @@ class VkTokenStore:
         self.access_token: str = data.get("access_token") or os.environ.get("VK_ACCESS_TOKEN", "").strip()
         self.refresh_token: str = data.get("refresh_token") or os.environ.get("VK_REFRESH_TOKEN", "").strip()
         self.device_id: str = data.get("device_id") or os.environ.get("VK_DEVICE_ID", "").strip()
+        if not data and os.environ.get("VK_AUTH_CODE", "").strip():
+            self._bootstrap_from_code()
         if not self.access_token:
             raise SystemExit(
-                "Не задан токен ВК: укажите VK_ACCESS_TOKEN или положите vk_token.json "
-                "в STATE_DIR (получить: python get_vk_token.py)"
+                "Не задан токен ВК: укажите VK_ACCESS_TOKEN или пару VK_AUTH_CODE + "
+                "VK_CODE_VERIFIER (получить: python get_vk_token.py <APP_ID> --for-server)"
             )
         if self.can_refresh():
             log.info("Токен ВК: автообновление включено (VK ID).")
@@ -56,6 +63,52 @@ class VkTokenStore:
                 "Токен ВК: автообновление выключено (нет VK_REFRESH_TOKEN/VK_APP_ID/VK_DEVICE_ID). "
                 "Токен VK ID живёт около часа — после протухания бот остановится на ошибке авторизации."
             )
+
+    def _bootstrap_from_code(self) -> None:
+        """Обменять код авторизации на токены при первом старте.
+
+        ВК привязывает токен к IP той машины, которая делает этот обмен, поэтому
+        на хостинге без консоли обмен выполняет сам бот: код и code_verifier
+        приезжают в переменных окружения, а запрос уходит с адреса сервера.
+
+        Код одноразовый и живёт считанные минуты — после успеха токены лежат в
+        vk_token.json, и переменные VK_AUTH_CODE/VK_CODE_VERIFIER больше не нужны.
+        """
+        code = os.environ.get("VK_AUTH_CODE", "").strip()
+        verifier = os.environ.get("VK_CODE_VERIFIER", "").strip()
+        redirect_uri = os.environ.get("VK_REDIRECT_URI", DEFAULT_REDIRECT_URI).strip()
+        if not verifier or not self.app_id:
+            log.error("Для обмена кода нужны VK_CODE_VERIFIER и VK_APP_ID — пропускаем.")
+            return
+
+        log.info("Меняем код авторизации на токены ВК...")
+        try:
+            resp = requests.post(VK_ID_AUTH_URL, data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "code_verifier": verifier,
+                "client_id": self.app_id,
+                "device_id": self.device_id,
+                "redirect_uri": redirect_uri,
+                "state": os.urandom(16).hex(),
+            }, timeout=30)
+            data = resp.json()
+        except Exception as e:
+            log.error("Ошибка сети при обмене кода: %s", e)
+            return
+
+        if "access_token" not in data:
+            log.error(
+                "VK ID не принял код: %s. Код одноразовый и быстро протухает — "
+                "получите новый (python get_vk_token.py <APP_ID> --for-server).", data
+            )
+            return
+
+        self.access_token = data["access_token"]
+        self.refresh_token = data.get("refresh_token", self.refresh_token)
+        self.device_id = data.get("device_id", self.device_id)
+        self._save()
+        log.info("Код обменян, токены сохранены в %s", self.path)
 
     def can_refresh(self) -> bool:
         return bool(self.refresh_token and self.app_id and self.device_id)

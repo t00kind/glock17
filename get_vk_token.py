@@ -104,7 +104,7 @@ def parse_args(argv: list) -> tuple:
     Полезно, когда VK ID показывает 'Error loading' без объяснений: запуск
     с --no-scope отвечает на вопрос, в правах дело или в настройках приложения.
     """
-    app_id, scope, manual = "", SCOPE, False
+    app_id, scope, manual, for_server = "", SCOPE, False, False
     args = argv[1:]
     while args:
         arg = args.pop(0)
@@ -112,11 +112,12 @@ def parse_args(argv: list) -> tuple:
             scope = ""
         elif arg == "--scope":
             scope = args.pop(0) if args else ""
-        elif arg == "--manual":
+        elif arg in ("--manual", "--for-server"):
             manual = True
+            for_server = arg == "--for-server"
         elif not app_id:
             app_id = arg.strip()
-    return app_id, scope, manual
+    return app_id, scope, manual, for_server
 
 
 class CatchHandler(BaseHTTPRequestHandler):
@@ -187,7 +188,7 @@ def ask_redirect_manually() -> dict:
 
 
 def main() -> int:
-    app_id, scope, manual = parse_args(sys.argv)
+    app_id, scope, manual, for_server = parse_args(sys.argv)
     app_id = app_id or APP_ID
     if not app_id:
         app_id = input("ID приложения (client_id из dev.vk.ru): ").strip()
@@ -201,8 +202,8 @@ def main() -> int:
     print(f"\nredirect_uri: {REDIRECT_URI}\nscope: {scope or '(не запрашиваем)'}")
 
     if manual:
-        # На сервере браузера нет, а токен ВК привязывается к IP той машины,
-        # которая меняла код на токен, — поэтому обмен должен идти отсюда
+        # Браузер не открываем: либо мы на сервере, либо код нужен для переноса
+        # на сервер (--for-server), где обмен и произойдёт
         print("\n1) Откройте ссылку в браузере на любой машине:\n")
         print(url)
         print("\n2) Разрешите доступ. Браузер уйдёт на адрес, который может не "
@@ -222,6 +223,18 @@ def main() -> int:
         print("\nКод авторизации не получен. Проверьте, что в настройках приложения "
               f"доверенный redirect URL — ровно {REDIRECT_URI}", file=sys.stderr)
         return 1
+    if for_server:
+        # Обмен не делаем: токен привязался бы к этой машине, а нужен IP сервера
+        print("\nПропишите на сервере и сразу перезапустите — код живёт минуты:\n")
+        print(f"VK_APP_ID={app_id}")
+        print(f"VK_AUTH_CODE={code}")
+        print(f"VK_CODE_VERIFIER={verifier}")
+        print(f"VK_DEVICE_ID={device_id}")
+        print(f"VK_REDIRECT_URI={REDIRECT_URI}")
+        print("\nБот обменяет код на токены сам, при старте, со своего адреса.")
+        print("После успешного старта эти переменные можно убрать: токены лягут "
+              "в vk_token.json внутри STATE_DIR.")
+        return 0
     if got_state and got_state != state:
         print("state не совпал — авторизация не та, начните заново.", file=sys.stderr)
         return 1
