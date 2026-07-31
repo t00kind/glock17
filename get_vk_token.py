@@ -4,12 +4,19 @@
 Старый implicit flow (oauth.vk.com/authorize?response_type=token) ВК закрыл:
 новым приложениям он отвечает invalid scope. Действующий путь — VK ID, и
 пройти его руками в браузере нельзя: нужен code_verifier, который знает
-только наша сторона. Поэтому скрипт делает всё сам — поднимает локальный
-сервер, ловит редирект с кодом и меняет код на токены.
+только наша сторона.
 
-Что нужно один раз настроить в приложении на dev.vk.ru:
-    Базовый домен:            localhost
-    Доверенный redirect URL:  http://localhost      (без порта и без пути)
+По умолчанию используется redirect https://oauth.vk.com/blank.html — он
+зарегистрирован у приложений сразу, настраивать в консоли ничего не нужно.
+После согласия ВК перекинет на пустую страницу, а адрес из строки браузера
+нужно вставить обратно в скрипт: код авторизации лежит в нём.
+
+Если в настройках приложения удастся прописать доверенный redirect на
+localhost, всё делается без копипаста — скрипт поднимет локальный сервер
+и поймает редирект сам:
+
+    set VK_REDIRECT_URI=http://localhost
+    python get_vk_token.py 54697320
 
 Запуск (на своей машине, не на сервере — нужен браузер):
 
@@ -17,7 +24,8 @@
     python get_vk_token.py              # спросит ID при запуске
 
 Дальше откроется браузер, вы жмёте «Разрешить» — и скрипт печатает готовые
-значения переменных. Если браузер не открылся сам, ссылка есть в консоли.
+значения переменных. Флаги --no-scope и --scope "wall,photos" помогают понять,
+на что ругается VK ID, если вместо формы согласия показывает "Error loading".
 
 На выходе — access_token и refresh_token. Первый кладём в VK_ACCESS_TOKEN,
 второй в VK_REFRESH_TOKEN, плюс VK_APP_ID и VK_DEVICE_ID: с этой четвёркой
@@ -26,10 +34,9 @@
 Переменные окружения:
   VK_APP_ID       - ID приложения (client_id), можно передать аргументом
   VK_REDIRECT_URI - redirect_uri ровно как в настройках приложения
-                    (по умолчанию http://localhost)
-  VK_PORT         - порт локального сервера-ловушки (по умолчанию 80,
-                    столько же подставляется в адрес редиректа)
-  VK_SCOPE        - права через пробел (по умолчанию wall photos video groups)
+                    (по умолчанию https://oauth.vk.com/blank.html)
+  VK_PORT         - порт локального сервера-ловушки, если redirect на localhost
+  VK_SCOPE        - права через запятую (по умолчанию wall,photos,video,groups)
 """
 
 import base64
@@ -48,8 +55,11 @@ VK_ID_AUTHORIZE_URL = "https://id.vk.com/authorize"
 VK_ID_AUTH_URL = "https://id.vk.com/oauth2/auth"
 
 APP_ID = os.environ.get("VK_APP_ID", "").strip()
-REDIRECT_URI = os.environ.get("VK_REDIRECT_URI", "http://localhost").strip()
-SCOPE = os.environ.get("VK_SCOPE", "wall photos video groups").strip()
+# Стандартный redirect зарегистрирован у приложений по умолчанию — с ним не нужно
+# ничего настраивать в консоли. Ловушка на localhost включается через VK_REDIRECT_URI.
+REDIRECT_URI = os.environ.get("VK_REDIRECT_URI", "https://oauth.vk.com/blank.html").strip()
+# Через запятую, а не через пробел: на пробелы VK ID отвечает страницей "Error loading"
+SCOPE = os.environ.get("VK_SCOPE", "wall,photos,video,groups").strip()
 PORT = int(os.environ.get("VK_PORT", "80"))
 
 PAGE_OK = "<h2>Готово. Токен получен, окно можно закрыть.</h2>"
@@ -148,6 +158,16 @@ def catch_redirect(url: str, timeout: int = 300) -> dict:
     return CatchHandler.query
 
 
+def show_link(url: str) -> dict:
+    """Просто открыть ссылку: код придётся забрать из адресной строки вручную."""
+    print("\nОткрываю браузер. Войдите под аккаунтом администратора сообщества "
+          "и разрешите доступ.")
+    print("Если браузер не открылся, откройте ссылку вручную:\n")
+    print(url + "\n")
+    webbrowser.open(url)
+    return {}
+
+
 def ask_redirect_manually() -> dict:
     """Запасной путь: пользователь вставляет адрес из браузера сам."""
     print("\nВставьте адрес, на который вас перекинуло (целиком, с ?code=...):")
@@ -168,7 +188,10 @@ def main() -> int:
     url = build_authorize_url(app_id, challenge, state, scope)
     print(f"\nredirect_uri: {REDIRECT_URI}\nscope: {scope or '(не запрашиваем)'}")
 
-    query = catch_redirect(url) or ask_redirect_manually()
+    # Ловушка имеет смысл только для localhost: на blank.html редирект уходит
+    # к ВК, и адрес с кодом остаётся лишь в адресной строке браузера
+    local = urlparse(REDIRECT_URI).hostname in ("localhost", "127.0.0.1")
+    query = (catch_redirect(url) if local else show_link(url)) or ask_redirect_manually()
 
     code = (query.get("code") or [""])[0]
     device_id = (query.get("device_id") or [""])[0]
