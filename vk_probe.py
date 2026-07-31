@@ -15,9 +15,11 @@
 или из файла .env рядом со скриптом — длинный ключ удобнее вставить в диалог
 или положить в .env, чем задавать через set.
 
-Скрипт заливает крошечную картинку, пробует опубликовать её тестовым постом
-и сразу удаляет пост. В группе ничего не остаётся — но пост на несколько
-секунд появится, так что запускайте, когда это не смущает.
+Скрипт сначала показывает вложения последних записей сообщества, затем для
+каждого способа заливает картинку 1x1, публикует тестовый пост и перечитывает
+его через wall.getById: только так видно, осталось вложение на стене или ВК
+принял его и молча выбросил. Тестовые посты остаются в группе — wall.delete
+ключу сообщества запрещён, удалите их вручную.
 """
 
 import base64
@@ -146,20 +148,62 @@ def try_album_upload() -> str:
     return f"OK attachment=photo{photo['owner_id']}_{photo['id']}"
 
 
-def try_post_and_delete(attachment: str) -> str:
-    """Проверить, что ВК принимает такое вложение в пост, и убрать пост."""
+def try_post_and_check(attachment: str) -> str:
+    """Опубликовать пост и проверить, что вложение реально осталось на стене.
+
+    wall.post отвечает успехом и на вложения, которые затем не показываются:
+    ответ API — не доказательство, нужно перечитать пост через wall.getById.
+    """
     posted = call("wall.post", {
         "owner_id": f"-{GROUP_ID}",
         "from_group": 1,
-        "message": "Проверка вложения, пост будет удалён автоматически",
+        "message": "Проверка вложения",
         "attachments": attachment,
     })
     if "error" in posted:
         return f"wall.post → {describe(posted)}"
     post_id = posted["response"]["post_id"]
-    deleted = call("wall.delete", {"owner_id": f"-{GROUP_ID}", "post_id": post_id})
-    suffix = "" if "error" not in deleted else f" (удалить не вышло: {describe(deleted)}, id={post_id})"
-    return f"wall.post принял вложение{suffix}"
+
+    got = call("wall.getById", {"posts": f"-{GROUP_ID}_{post_id}"})
+    if "error" in got:
+        return f"опубликован id={post_id}, но проверить не вышло: {describe(got)}"
+    items = got["response"].get("items", got["response"])
+    attachments = items[0].get("attachments", []) if items else []
+    kinds = [a.get("type") for a in attachments]
+    verdict = f"ВЛОЖЕНИЕ НА СТЕНЕ: {kinds}" if kinds else "ВЛОЖЕНИЕ ПОТЕРЯНО (на стене пусто)"
+    return f"{verdict}, пост id={post_id} — удалите вручную"
+
+
+def try_docs_upload() -> str:
+    """Обходной путь: залить картинку документом на стену сообщества."""
+    got = call("docs.getWallUploadServer", {"group_id": GROUP_ID})
+    if "error" in got:
+        return f"docs.getWallUploadServer → {describe(got)}"
+    resp = requests.post(
+        got["response"]["upload_url"],
+        files={"file": ("photo.jpg", TINY_JPEG, "image/jpeg")},
+        timeout=60,
+    )
+    resp.raise_for_status()
+    saved = call("docs.save", {"file": resp.json()["file"], "title": "photo"})
+    if "error" in saved:
+        return f"docs.save → {describe(saved)}"
+    doc = saved["response"]
+    doc = doc.get("doc", doc) if isinstance(doc, dict) else doc[0]
+    return f"OK attachment=doc{doc['owner_id']}_{doc['id']}"
+
+
+def show_recent_posts() -> None:
+    """Показать типы вложений последних записей — видно, доехали ли фотографии."""
+    got = call("wall.get", {"owner_id": f"-{GROUP_ID}", "count": 5})
+    if "error" in got:
+        print(f"wall.get: {describe(got)}")
+        return
+    print("Последние записи сообщества:")
+    for item in got["response"].get("items", []):
+        kinds = [a.get("type") for a in item.get("attachments", [])]
+        text = (item.get("text") or "")[:40]
+        print(f"   id={item['id']:>4}  вложения={kinds or 'нет'}  «{text}»")
 
 
 def main() -> int:
@@ -172,12 +216,14 @@ def main() -> int:
     print(f"Сообщество: {GROUP_ID}\nТокен: {TOKEN[:8]}...{TOKEN[-4:]}\n")
 
     whoami = call("groups.getById", {"group_id": GROUP_ID})
-    print(f"groups.getById: {describe(whoami)}")
+    print(f"groups.getById: {describe(whoami)}\n")
+    show_recent_posts()
 
     for name, probe in (
         ("1. Штатная загрузка на стену", try_wall_upload),
         ("2. Через сервер сообщений", try_messages_upload),
         ("3. Через альбом сообщества", try_album_upload),
+        ("4. Документом на стену", try_docs_upload),
     ):
         print(f"\n{name}")
         try:
@@ -187,7 +233,7 @@ def main() -> int:
         print(f"   {result}")
         if result.startswith("OK attachment="):
             attachment = result.split("=", 1)[1]
-            print(f"   {try_post_and_delete(attachment)}")
+            print(f"   {try_post_and_check(attachment)}")
 
     print("\nГотово. Пришлите этот вывод целиком.")
     return 0
