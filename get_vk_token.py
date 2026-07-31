@@ -64,16 +64,37 @@ def make_pkce() -> tuple:
     return verifier, challenge
 
 
-def build_authorize_url(app_id: str, challenge: str, state: str) -> str:
-    return f"{VK_ID_AUTHORIZE_URL}?" + urlencode({
+def build_authorize_url(app_id: str, challenge: str, state: str, scope: str) -> str:
+    params = {
         "response_type": "code",
         "client_id": app_id,
         "redirect_uri": REDIRECT_URI,
-        "scope": SCOPE,
         "state": state,
         "code_challenge": challenge,
         "code_challenge_method": "S256",
-    })
+    }
+    if scope:  # пустой scope — диагностика: так VK ID не может ругаться на права
+        params["scope"] = scope
+    return f"{VK_ID_AUTHORIZE_URL}?" + urlencode(params)
+
+
+def parse_args(argv: list) -> tuple:
+    """Разобрать аргументы: ID приложения, scope и режим диагностики.
+
+    Полезно, когда VK ID показывает 'Error loading' без объяснений: запуск
+    с --no-scope отвечает на вопрос, в правах дело или в настройках приложения.
+    """
+    app_id, scope = "", SCOPE
+    args = argv[1:]
+    while args:
+        arg = args.pop(0)
+        if arg == "--no-scope":
+            scope = ""
+        elif arg == "--scope":
+            scope = args.pop(0) if args else ""
+        elif not app_id:
+            app_id = arg.strip()
+    return app_id, scope
 
 
 class CatchHandler(BaseHTTPRequestHandler):
@@ -134,7 +155,8 @@ def ask_redirect_manually() -> dict:
 
 
 def main() -> int:
-    app_id = (sys.argv[1] if len(sys.argv) > 1 else APP_ID).strip()
+    app_id, scope = parse_args(sys.argv)
+    app_id = app_id or APP_ID
     if not app_id:
         app_id = input("ID приложения (client_id из dev.vk.ru): ").strip()
     if not app_id.isdigit():
@@ -143,7 +165,8 @@ def main() -> int:
 
     verifier, challenge = make_pkce()
     state = secrets.token_urlsafe(16)
-    url = build_authorize_url(app_id, challenge, state)
+    url = build_authorize_url(app_id, challenge, state, scope)
+    print(f"\nredirect_uri: {REDIRECT_URI}\nscope: {scope or '(не запрашиваем)'}")
 
     query = catch_redirect(url) or ask_redirect_manually()
 
