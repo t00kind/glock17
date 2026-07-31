@@ -14,12 +14,16 @@
   VK_DEVICE_ID      - device_id от VK ID, нужен для обновления токена
   VK_GROUP_ID       - числовой ID сообщества ВКонтакте (без минуса)
   VK_API_VERSION    - версия API (по умолчанию 5.199)
+  VK_RATE_LIMIT     - запросов в секунду к VK API (по умолчанию 3 — лимит ВК
+                      для пользовательского токена)
 
 Получить всю четвёрку токенов: python get_vk_token.py
 """
 
 import logging
 import os
+import threading
+import time
 from typing import Optional
 
 import requests
@@ -51,32 +55,79 @@ VK_WALL_OWNER_ID = f"-{VK_GROUP_ID}"
 # Ошибки авторизации VK: 5 - токен недействителен/протух, 27 - метод недоступен
 # ключу сообщества (нужен пользовательский токен), 28 - протух ключ приложения
 VK_AUTH_ERRORS = (5, 28)
+VK_TOO_MANY_REQUESTS = 6
+
+# ВК разрешает пользовательскому токену 3 запроса в секунду. Пост с десятью
+# фотографиями — это десяток загрузок подряд, и без паузы ВК отвечает ошибкой 6.
+VK_RATE_LIMIT = float(os.environ.get("VK_RATE_LIMIT", "3"))
+VK_MIN_INTERVAL = 1.0 / VK_RATE_LIMIT if VK_RATE_LIMIT > 0 else 0.0
+VK_MAX_RETRIES = 3
+
+_rate_lock = threading.Lock()
+_last_call_at = 0.0
 
 
-def vk_call(method: str, params: dict, _retried: bool = False) -> dict:
+def _throttle() -> None:
+    """Выдержать паузу между запросами к API.
+
+    Блокировка общая на процесс: в режиме CROSSPOST_TARGET=all потоки ОК и ВК
+    живут вместе, и считать интервал каждый сам по себе было бы неверно.
+    """
+    global _last_call_at
+    if VK_MIN_INTERVAL <= 0:
+        return
+    with _rate_lock:
+        wait = _last_call_at + VK_MIN_INTERVAL - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        _last_call_at = time.monotonic()
+
+
+def vk_call(method: str, params: dict) -> dict:
     """Выполнить запрос к VK API. Бросает RuntimeError на ошибку API.
 
-    Токены VK ID живут около часа, поэтому на ошибке авторизации один раз
-    обновляем токен и повторяем запрос — иначе бот умирал бы каждый час.
+    Токены VK ID живут около часа, поэтому на ошибке авторизации обновляем
+    токен и повторяем запрос. Ошибка 6 (слишком часто) — не повод терять пост:
+    ждём и пробуем снова.
     """
-    payload = {**params, "access_token": TOKENS.access_token, "v": VK_API_VERSION}
-    resp = requests.post(f"{VK_API}/{method}", data=payload, timeout=60)
-    resp.raise_for_status()
-    data = resp.json()
-    if "error" in data:
+    refreshed = False
+    for attempt in range(1, VK_MAX_RETRIES + 1):
+        _throttle()
+        resp = requests.post(
+            f"{VK_API}/{method}",
+            data={**params, "access_token": TOKENS.access_token, "v": VK_API_VERSION},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if "error" not in data:
+            log.debug("%s → %s", method, data.get("response"))
+            return data["response"]
+
         err = data["error"]
         code = err.get("error_code")
-        if code in VK_AUTH_ERRORS and not _retried and TOKENS.refresh():
-            return vk_call(method, params, _retried=True)
+        if code == VK_TOO_MANY_REQUESTS and attempt < VK_MAX_RETRIES:
+            pause = VK_MIN_INTERVAL * 2 * attempt
+            log.warning("ВК просит сбавить темп, ждём %.1f с и повторяем %s", pause, method)
+            time.sleep(pause)
+            continue
+        if code in VK_AUTH_ERRORS and not refreshed and TOKENS.refresh():
+            refreshed = True
+            continue
         if code == 27:
             raise RuntimeError(
                 f"VK API error 27: {err.get('error_msg')}. "
                 "Метод недоступен ключу сообщества — нужен пользовательский токен "
                 "администратора (python get_vk_token.py)"
             )
+        if code in VK_AUTH_ERRORS and "another ip" in (err.get("error_msg") or ""):
+            raise RuntimeError(
+                f"VK API error {code}: {err.get('error_msg')}. "
+                "Токен привязан к IP машины, где его получали — получите его "
+                "на сервере: python get_vk_token.py <APP_ID> --manual"
+            )
         raise RuntimeError(f"VK API error {code}: {err.get('error_msg')}")
-    log.debug("%s → %s", method, data.get("response"))
-    return data["response"]
+    raise RuntimeError(f"VK API {method}: исчерпаны попытки из-за лимита запросов")
 
 
 def vk_upload_photo(image_url: str) -> Optional[str]:

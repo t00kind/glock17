@@ -27,6 +27,16 @@ localhost, всё делается без копипаста — скрипт п
 значения переменных. Флаги --no-scope и --scope "wall,photos" помогают понять,
 на что ругается VK ID, если вместо формы согласия показывает "Error loading".
 
+ВАЖНО про IP. ВК привязывает токен к адресу той машины, которая меняла код на
+токен, и с другого адреса отвечает "access_token was given to another ip
+address". Поэтому для бота на сервере запускать скрипт нужно НА СЕРВЕРЕ:
+
+    python get_vk_token.py 12345678 --manual
+
+В этом режиме скрипт ничего не открывает: печатает ссылку, вы проходите её в
+браузере на своей машине и вставляете обратно адрес, куда вас перекинуло.
+Обмен кода на токен уйдёт с сервера, и токен привяжется к его IP.
+
 На выходе — access_token и refresh_token. Первый кладём в VK_ACCESS_TOKEN,
 второй в VK_REFRESH_TOKEN, плюс VK_APP_ID и VK_DEVICE_ID: с этой четвёркой
 бот обновляет протухший токен сам.
@@ -94,7 +104,7 @@ def parse_args(argv: list) -> tuple:
     Полезно, когда VK ID показывает 'Error loading' без объяснений: запуск
     с --no-scope отвечает на вопрос, в правах дело или в настройках приложения.
     """
-    app_id, scope = "", SCOPE
+    app_id, scope, manual = "", SCOPE, False
     args = argv[1:]
     while args:
         arg = args.pop(0)
@@ -102,9 +112,11 @@ def parse_args(argv: list) -> tuple:
             scope = ""
         elif arg == "--scope":
             scope = args.pop(0) if args else ""
+        elif arg == "--manual":
+            manual = True
         elif not app_id:
             app_id = arg.strip()
-    return app_id, scope
+    return app_id, scope, manual
 
 
 class CatchHandler(BaseHTTPRequestHandler):
@@ -175,7 +187,7 @@ def ask_redirect_manually() -> dict:
 
 
 def main() -> int:
-    app_id, scope = parse_args(sys.argv)
+    app_id, scope, manual = parse_args(sys.argv)
     app_id = app_id or APP_ID
     if not app_id:
         app_id = input("ID приложения (client_id из dev.vk.ru): ").strip()
@@ -188,10 +200,19 @@ def main() -> int:
     url = build_authorize_url(app_id, challenge, state, scope)
     print(f"\nredirect_uri: {REDIRECT_URI}\nscope: {scope or '(не запрашиваем)'}")
 
-    # Ловушка имеет смысл только для localhost: на blank.html редирект уходит
-    # к ВК, и адрес с кодом остаётся лишь в адресной строке браузера
-    local = urlparse(REDIRECT_URI).hostname in ("localhost", "127.0.0.1")
-    query = (catch_redirect(url) if local else show_link(url)) or ask_redirect_manually()
+    if manual:
+        # На сервере браузера нет, а токен ВК привязывается к IP той машины,
+        # которая меняла код на токен, — поэтому обмен должен идти отсюда
+        print("\n1) Откройте ссылку в браузере на любой машине:\n")
+        print(url)
+        print("\n2) Разрешите доступ. Браузер уйдёт на адрес, который может не "
+              "открыться — это нормально, нужен только сам адрес из строки.")
+        query = ask_redirect_manually()
+    else:
+        # Ловушка имеет смысл только для localhost: на blank.html редирект уходит
+        # к ВК, и адрес с кодом остаётся лишь в адресной строке браузера
+        local = urlparse(REDIRECT_URI).hostname in ("localhost", "127.0.0.1")
+        query = (catch_redirect(url) if local else show_link(url)) or ask_redirect_manually()
 
     code = (query.get("code") or [""])[0]
     device_id = (query.get("device_id") or [""])[0]
