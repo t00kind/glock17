@@ -1,31 +1,34 @@
 """
 Получение пользовательского токена ВК через VK ID (OAuth 2.1 + PKCE).
 =====================================================================
-Старый implicit flow (oauth.vk.com/authorize?response_type=token) для новых
-приложений отдаёт invalid_request/invalid scope — ВК перевёл авторизацию на
-VK ID. Здесь тот же путь, только руками в браузере его не пройти: нужен
-code_verifier, который знает лишь наша сторона.
+Старый implicit flow (oauth.vk.com/authorize?response_type=token) ВК закрыл:
+новым приложениям он отвечает invalid scope. Действующий путь — VK ID, и
+пройти его руками в браузере нельзя: нужен code_verifier, который знает
+только наша сторона. Поэтому скрипт делает всё сам — поднимает локальный
+сервер, ловит редирект с кодом и меняет код на токены.
 
-Запуск (локально, не на сервере — нужен браузер):
+Что нужно один раз настроить в приложении на dev.vk.ru:
+    Базовый домен:            localhost
+    Доверенный redirect URL:  http://localhost      (без порта и без пути)
+
+Запуск (на своей машине, не на сервере — нужен браузер):
 
     python get_vk_token.py 54697320     # ID приложения аргументом
     python get_vk_token.py              # спросит ID при запуске
 
-ID можно задать и переменной VK_APP_ID, но в PowerShell/cmd это отдельная
-команда, поэтому аргумент проще.
-
-Скрипт напечатает ссылку, вы открываете её в браузере под аккаунтом
-администратора сообщества, разрешаете доступ, и вставляете сюда адрес
-страницы, на которую вас перекинуло (целиком, вместе с ?code=...&device_id=...).
+Дальше откроется браузер, вы жмёте «Разрешить» — и скрипт печатает готовые
+значения переменных. Если браузер не открылся сам, ссылка есть в консоли.
 
 На выходе — access_token и refresh_token. Первый кладём в VK_ACCESS_TOKEN,
 второй в VK_REFRESH_TOKEN, плюс VK_APP_ID и VK_DEVICE_ID: с этой четвёркой
 бот обновляет протухший токен сам.
 
 Переменные окружения:
-  VK_APP_ID       - ID Standalone-приложения (client_id), обязателен
-  VK_REDIRECT_URI - redirect_uri, ровно как в настройках приложения
-                    (по умолчанию https://oauth.vk.ru/blank.html)
+  VK_APP_ID       - ID приложения (client_id), можно передать аргументом
+  VK_REDIRECT_URI - redirect_uri ровно как в настройках приложения
+                    (по умолчанию http://localhost)
+  VK_PORT         - порт локального сервера-ловушки (по умолчанию 80,
+                    столько же подставляется в адрес редиректа)
   VK_SCOPE        - права через пробел (по умолчанию wall photos video groups)
 """
 
@@ -34,6 +37,9 @@ import hashlib
 import os
 import secrets
 import sys
+import threading
+import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
@@ -42,8 +48,12 @@ VK_ID_AUTHORIZE_URL = "https://id.vk.com/authorize"
 VK_ID_AUTH_URL = "https://id.vk.com/oauth2/auth"
 
 APP_ID = os.environ.get("VK_APP_ID", "").strip()
-REDIRECT_URI = os.environ.get("VK_REDIRECT_URI", "https://oauth.vk.ru/blank.html").strip()
+REDIRECT_URI = os.environ.get("VK_REDIRECT_URI", "http://localhost").strip()
 SCOPE = os.environ.get("VK_SCOPE", "wall photos video groups").strip()
+PORT = int(os.environ.get("VK_PORT", "80"))
+
+PAGE_OK = "<h2>Готово. Токен получен, окно можно закрыть.</h2>"
+PAGE_FAIL = "<h2>В адресе нет кода авторизации. Вернитесь в консоль.</h2>"
 
 
 def make_pkce() -> tuple:
@@ -54,18 +64,8 @@ def make_pkce() -> tuple:
     return verifier, challenge
 
 
-def main() -> int:
-    app_id = (sys.argv[1] if len(sys.argv) > 1 else APP_ID).strip()
-    if not app_id:
-        app_id = input("ID Standalone-приложения (client_id из dev.vk.ru): ").strip()
-    if not app_id.isdigit():
-        print(f"ID приложения должен быть числом, получено: {app_id!r}", file=sys.stderr)
-        return 1
-
-    verifier, challenge = make_pkce()
-    state = secrets.token_urlsafe(16)
-
-    url = f"{VK_ID_AUTHORIZE_URL}?" + urlencode({
+def build_authorize_url(app_id: str, challenge: str, state: str) -> str:
+    return f"{VK_ID_AUTHORIZE_URL}?" + urlencode({
         "response_type": "code",
         "client_id": app_id,
         "redirect_uri": REDIRECT_URI,
@@ -75,19 +75,85 @@ def main() -> int:
         "code_challenge_method": "S256",
     })
 
-    print("\n1) Откройте ссылку в браузере под аккаунтом администратора сообщества:\n")
-    print(url)
-    print("\n2) Разрешите доступ. Вас перекинет на страницу с ?code=... в адресе.")
-    print("   Скопируйте адрес целиком и вставьте сюда.\n")
 
-    redirected = input("Адрес после редиректа: ").strip()
-    query = parse_qs(urlparse(redirected).query)
+class CatchHandler(BaseHTTPRequestHandler):
+    """Принимает единственный запрос — редирект VK ID с ?code=... в адресе."""
+
+    query: dict = {}
+
+    def do_GET(self):
+        CatchHandler.query = parse_qs(urlparse(self.path).query)
+        body = (PAGE_OK if CatchHandler.query.get("code") else PAGE_FAIL).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):  # без служебного шума в консоли
+        pass
+
+
+def catch_redirect(url: str, timeout: int = 300) -> dict:
+    """Поднять локальный сервер, открыть браузер и дождаться редиректа.
+
+    Возвращает разобранный query редиректа либо {} — тогда вызывающий код
+    откатывается на ручной ввод адреса.
+    """
+    try:
+        server = HTTPServer(("127.0.0.1", PORT), CatchHandler)
+    except OSError as e:
+        print(f"\nНе удалось занять порт {PORT}: {e}", file=sys.stderr)
+        print("Порт занят или нужен запуск от администратора. "
+              "Можно указать другой: VK_PORT (и такой же redirect в настройках ВК).",
+              file=sys.stderr)
+        return {}
+
+    CatchHandler.query = {}
+    # Один запрос и выходим: больше редиректов не будет, висеть сервером незачем
+    thread = threading.Thread(target=server.handle_request, daemon=True)
+    thread.start()
+
+    print("\nОткрываю браузер. Войдите под аккаунтом администратора сообщества "
+          "и разрешите доступ.")
+    print("Если браузер не открылся, откройте ссылку вручную:\n")
+    print(url + "\n")
+    webbrowser.open(url)
+
+    thread.join(timeout)
+    server.server_close()
+    if not CatchHandler.query:
+        print("Не дождались редиректа.", file=sys.stderr)
+    return CatchHandler.query
+
+
+def ask_redirect_manually() -> dict:
+    """Запасной путь: пользователь вставляет адрес из браузера сам."""
+    print("\nВставьте адрес, на который вас перекинуло (целиком, с ?code=...):")
+    return parse_qs(urlparse(input("Адрес после редиректа: ").strip()).query)
+
+
+def main() -> int:
+    app_id = (sys.argv[1] if len(sys.argv) > 1 else APP_ID).strip()
+    if not app_id:
+        app_id = input("ID приложения (client_id из dev.vk.ru): ").strip()
+    if not app_id.isdigit():
+        print(f"ID приложения должен быть числом, получено: {app_id!r}", file=sys.stderr)
+        return 1
+
+    verifier, challenge = make_pkce()
+    state = secrets.token_urlsafe(16)
+    url = build_authorize_url(app_id, challenge, state)
+
+    query = catch_redirect(url) or ask_redirect_manually()
+
     code = (query.get("code") or [""])[0]
     device_id = (query.get("device_id") or [""])[0]
     got_state = (query.get("state") or [""])[0]
 
     if not code:
-        print("В адресе нет параметра code. Скопируйте строку browser'а целиком.", file=sys.stderr)
+        print("\nКод авторизации не получен. Проверьте, что в настройках приложения "
+              f"доверенный redirect URL — ровно {REDIRECT_URI}", file=sys.stderr)
         return 1
     if got_state and got_state != state:
         print("state не совпал — авторизация не та, начните заново.", file=sys.stderr)
