@@ -8,9 +8,12 @@
 
 Запуск (на любой машине, ключ сообщества к IP не привязан):
 
-    set VK_ACCESS_TOKEN=vk1.a....      # ключ сообщества из настроек группы
-    set VK_GROUP_ID=239611995
-    python vk_probe.py
+    python vk_probe.py                 # спросит ключ и ID сообщества
+    python vk_probe.py vk1.a.... 239611995
+
+Значения берутся также из переменных окружения VK_ACCESS_TOKEN и VK_GROUP_ID
+или из файла .env рядом со скриптом — длинный ключ удобнее вставить в диалог
+или положить в .env, чем задавать через set.
 
 Скрипт заливает крошечную картинку, пробует опубликовать её тестовым постом
 и сразу удаляет пост. В группе ничего не остаётся — но пост на несколько
@@ -23,9 +26,15 @@ import sys
 
 import requests
 
+try:  # .env читаем, если библиотека есть — она и так в зависимостях бота
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 VK_API = "https://api.vk.com/method"
-TOKEN = os.environ.get("VK_ACCESS_TOKEN", "").strip()
-GROUP_ID = os.environ.get("VK_GROUP_ID", "").strip().lstrip("-")
+TOKEN = ""
+GROUP_ID = ""
 API_VERSION = os.environ.get("VK_API_VERSION", "5.199")
 
 # Картинка 1x1 пиксель — размер не важен, важна сама возможность залить
@@ -34,6 +43,18 @@ TINY_JPEG = base64.b64decode(
     "HBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAABAAAAAAAA"
     "AAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AKp//2Q=="
 )
+
+
+def read_settings(argv: list) -> tuple:
+    """Ключ и ID сообщества: из аргументов, окружения, .env или диалога."""
+    token = (argv[1] if len(argv) > 1 else os.environ.get("VK_ACCESS_TOKEN", "")).strip()
+    group = (argv[2] if len(argv) > 2 else os.environ.get("VK_GROUP_ID", "")).strip()
+    if not token:
+        print("Ключ доступа сообщества (настройки группы → Работа с API → Ключи доступа).")
+        token = input("Вставьте ключ: ").strip()
+    if not group:
+        group = input("ID сообщества (только цифры): ").strip()
+    return token, group.lstrip("-")
 
 
 def call(method: str, params: dict) -> dict:
@@ -142,8 +163,10 @@ def try_post_and_delete(attachment: str) -> str:
 
 
 def main() -> int:
+    global TOKEN, GROUP_ID
+    TOKEN, GROUP_ID = read_settings(sys.argv)
     if not TOKEN or not GROUP_ID:
-        print("Задайте VK_ACCESS_TOKEN (ключ сообщества) и VK_GROUP_ID", file=sys.stderr)
+        print("Нужны ключ сообщества и ID сообщества", file=sys.stderr)
         return 1
 
     print(f"Сообщество: {GROUP_ID}\nТокен: {TOKEN[:8]}...{TOKEN[-4:]}\n")
